@@ -1,4 +1,7 @@
 import { useState, useMemo, useEffect } from "react";
+import { motion, AnimatePresence, animate, useReducedMotion } from "framer-motion";
+import { supabase, isSupabaseConfigured } from "./lib/supabase";
+import { saveAssessment, fetchAssessments } from "./lib/db";
 
 /* ═══════════════════════════════════════════════
    HOSPITALS
@@ -337,7 +340,7 @@ const css = `
 :root{--k:#111;--k2:#333;--k3:#666;--k4:#999;--g1:#f0f0f0;--g2:#e4e4e4;--g3:#ccc;--w:#fff;--r:#c8102e;--serif:'Instrument Serif',serif;--sans:'DM Sans',sans-serif;--mono:'DM Mono',monospace}
 html,body,#root{height:100%}
 body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smoothing:antialiased}
-.app{min-height:100vh;max-width:460px;margin:0 auto;display:flex;flex-direction:column}
+.app{min-height:100dvh;max-width:460px;width:100%;margin:0 auto;display:flex;flex-direction:column;background:var(--w)}
 .hdr{background:var(--k);padding:14px 20px;position:sticky;top:0;z-index:50}
 .hdr-row{display:flex;align-items:baseline;justify-content:space-between}
 .hdr-brand{font-family:var(--serif);font-size:18px;color:var(--w);font-style:italic}
@@ -449,6 +452,72 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .settings-input:focus{border-color:var(--k)}.settings-note{font-size:12px;color:var(--k4);line-height:1.6}
 .wh-status{font-size:11px;margin-top:6px;font-family:var(--mono)}
 .wh-ok{color:#16a34a}.wh-fail{color:var(--r)}.wh-none{color:var(--k4)}
+
+/* ═══════════════════════════════════════════════
+   RESPONSIVE — Desktop / Tablet web view
+   Mobile-first above; the column becomes a centered
+   editorial panel on larger screens (line length stays
+   readable — correct UX for a clinical form).
+═══════════════════════════════════════════════ */
+@media (min-width:768px){
+  body{background:var(--g1)}
+  .app{max-width:600px;min-height:calc(100dvh - 64px);margin:32px auto;
+       border:1px solid var(--g2);box-shadow:0 1px 3px rgba(0,0,0,.06),0 10px 30px rgba(0,0,0,.05)}
+  .hdr{position:static}
+  .main{padding:40px 48px 56px}
+  .home-hero{padding:40px 0 32px}
+  .home-title{font-size:44px}
+  .home-sub{max-width:320px}
+  .display{font-size:34px}
+  .domain-title{font-size:32px}
+}
+@media (min-width:1024px){
+  .app{max-width:640px;margin:48px auto;min-height:calc(100dvh - 96px)}
+  .main{padding:48px 56px 64px}
+}
+
+/* ═══════════════════════════════════════════════
+   ACCESSIBILITY — focus visibility + reduced motion
+═══════════════════════════════════════════════ */
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--k);outline-offset:2px}
+.opt:focus-visible,.ci-row:focus-visible,.hosp-card:focus-visible,.confirm-check-row:focus-visible{outline:2px solid var(--k);outline-offset:1px}
+.copy-btn:focus-visible,.btn-p:focus-visible{outline:2px solid var(--w);outline-offset:-4px}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important;scroll-behavior:auto!important}
+}
+
+/* ── Tactile press feedback (instant for reduced-motion via rule above) ── */
+.btn-p,.btn-s,.home-btn-new,.home-btn-sec,.copy-btn,.opt,.ci-row,.hosp-card,.record-item,.tbtn,.export-btn,.confirm-check-row{transition:transform .1s ease,border-color .12s ease,background .12s ease,opacity .12s ease,box-shadow .12s ease}
+.btn-p:active,.home-btn-new:active{transform:scale(.985)}
+.btn-s:active,.home-btn-sec:active,.copy-btn:active,.opt:active,.ci-row:active,.hosp-card:active,.record-item:active,.tbtn:active,.export-btn:active,.confirm-check-row:active{transform:scale(.99)}
+
+/* ═══════════════════════════════════════════════
+   AUTH + PROFILE
+═══════════════════════════════════════════════ */
+.hdr-acct{width:30px;height:30px;border-radius:50%;border:1px solid #555;background:transparent;color:var(--w);font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:border-color .12s,background .12s}
+.hdr-acct:hover{border-color:var(--w);background:#222}
+.hdr-acct-link{background:none;border:none;color:#bbb;font-family:var(--sans);font-size:12px;font-weight:500;cursor:pointer;letter-spacing:.02em;padding:6px 4px}
+.hdr-acct-link:hover{color:var(--w)}
+.auth-title{font-family:var(--serif);font-style:italic;font-size:34px;letter-spacing:-.02em;color:var(--k);margin-bottom:6px}
+.auth-sub{font-size:13px;color:var(--k4);line-height:1.6;margin-bottom:24px}
+.auth-field{margin-bottom:14px}
+.auth-label{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--k4);margin-bottom:6px;display:block}
+.auth-input{width:100%;padding:12px 13px;border:1px solid var(--g2);font-family:var(--sans);font-size:15px;color:var(--k);background:var(--w);outline:none;transition:border-color .12s}
+.auth-input:focus{border-color:var(--k)}
+.google-btn{width:100%;padding:12px 16px;background:var(--w);border:1px solid var(--g3);font-family:var(--sans);font-size:14px;font-weight:600;color:var(--k);cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:background .12s,border-color .12s}
+.google-btn:hover{background:var(--g1);border-color:var(--k4)}
+.auth-divider{display:flex;align-items:center;gap:12px;margin:18px 0;color:var(--k4);font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+.auth-divider::before,.auth-divider::after{content:"";flex:1;height:1px;background:var(--g2)}
+.auth-toggle{text-align:center;font-size:13px;color:var(--k4);margin-top:18px}
+.auth-toggle button{background:none;border:none;color:var(--k);font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:3px;padding:0}
+.otp-input{width:100%;padding:16px;border:1.5px solid var(--g2);font-family:var(--mono);font-size:30px;font-weight:500;letter-spacing:.45em;text-align:center;color:var(--k);background:var(--w);outline:none;text-indent:.45em}
+.otp-input:focus{border-color:var(--k)}
+.profile-card{border:1px solid var(--g2);padding:18px;margin-bottom:20px;display:flex;align-items:center;gap:14px}
+.profile-avatar{width:48px;height:48px;border-radius:50%;background:var(--k);color:var(--w);font-family:var(--serif);font-style:italic;font-size:22px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.profile-name{font-size:16px;font-weight:600;color:var(--k)}
+.profile-email{font-size:12.5px;color:var(--k4);margin-top:2px}
+.profile-stat{display:flex;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--g1);font-size:13px;color:var(--k2)}
+.profile-stat-val{font-family:var(--mono);color:var(--k)}
 `;
 
 /* ═══════════════════════════════════════════════
@@ -486,18 +555,31 @@ function ToggleField({field,value,onChange}){
     </div>
   );
 }
-function RecCard({rec,index}){
+function RecCard({rec,index,reduce}){
   const urgent=rec.p===1;
   return(
-    <div className="rec-item">
+    <motion.div className="rec-item"
+      initial={reduce?false:{opacity:0,y:10}}
+      animate={{opacity:1,y:0}}
+      transition={{duration:0.3,delay:Math.min(index*0.045,0.55),ease:[0.22,0.61,0.36,1]}}>
       <div className="rec-meta">
         <span className={`rec-index ${urgent?"urg":""}`}>{String(index+1).padStart(2,"0")}</span>
         {urgent&&<span className="rec-dot"/>}
         <span className={`rec-cat ${urgent?"urg":""}`}>{rec.cat}</span>
       </div>
       <div className="rec-body">{rec.text}</div>
-    </div>
+    </motion.div>
   );
+}
+/* Animated count-up for the score; respects reduced motion */
+function AnimatedNumber({value,reduce,duration=0.85}){
+  const [display,setDisplay]=useState(reduce?value:0);
+  useEffect(()=>{
+    if(reduce){ setDisplay(value); return; }
+    const controls=animate(0,value,{duration,ease:[0.16,1,0.3,1],onUpdate:v=>setDisplay(Math.round(v))});
+    return()=>controls.stop();
+  },[value,reduce,duration]);
+  return <>{display}</>;
 }
 function TierChip({tierId}){
   const labels={low:"Low",moderate:"Moderate",high:"High",not_ideal:"Not Ideal"};
@@ -532,14 +614,59 @@ export default function F2FApp(){
   const [webhookInput, setWebhookInput] = useState("");
   const [webhookStatus,setWebhookStatus]= useState(null);
   const [savingWh,     setSavingWh]     = useState(false);
+  // Auth / session
+  const [session,      setSession]      = useState(null);
+  const [authReady,    setAuthReady]    = useState(false);
+  const [authMode,     setAuthMode]     = useState("signin"); // signin | signup | otp
+  const [authName,     setAuthName]     = useState("");
+  const [authEmail,    setAuthEmail]    = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authCode,     setAuthCode]     = useState("");
+  const [authLoading,  setAuthLoading]  = useState(false);
+  const [authError,    setAuthError]    = useState("");
+  const [authNotice,   setAuthNotice]   = useState("");
 
-  // Load persisted data on mount
+  // Load settings on mount (assessments are loaded by the [user] effect below)
   useEffect(()=>{
     const url = lsGet("f2f_setting_webhook")||"";
     setWebhookUrl(url); setWebhookInput(url);
-    setCases(fetchAllCases());
   },[]);
 
+  // Subscribe to Supabase auth session
+  useEffect(()=>{
+    if(!supabase){ setAuthReady(true); return; }
+    supabase.auth.getSession().then(({data})=>{ setSession(data.session); setAuthReady(true); });
+    const {data:sub}=supabase.auth.onAuthStateChange((_evt,s)=>setSession(s));
+    return ()=>sub.subscription.unsubscribe();
+  },[]);
+
+  const user     = session?.user ?? null;
+  const userName = user?.user_metadata?.full_name || user?.email || "";
+  const userInitial = (userName||"?").trim().charAt(0).toUpperCase();
+
+  // Load assessments from cloud (signed in) or localStorage (guest)
+  async function refreshCases(){
+    if(user && supabase){
+      try{ setCases(await fetchAssessments()); }
+      catch(e){ console.warn("[F2F] load assessments failed:",e?.message); setCases([]); }
+    } else {
+      setCases(fetchAllCases());
+    }
+  }
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      if(user && supabase){
+        try{ const rows=await fetchAssessments(); if(!cancelled) setCases(rows); }
+        catch(e){ if(!cancelled){ console.warn("[F2F] load assessments failed:",e?.message); setCases([]); } }
+      } else if(!cancelled){
+        setCases(fetchAllCases());
+      }
+    })();
+    return ()=>{cancelled=true;};
+  },[user]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const reduce     = useReducedMotion();
   const hasRedFlag = Object.values(ciChecked).some(Boolean);
   const domain     = DOMAINS[wizStep-2]??null;
   const updateAnswer=(id,val)=>setAnswers(p=>({...p,[id]:val}));
@@ -588,8 +715,13 @@ export default function F2FApp(){
         savedAt:new Date().toISOString(), answers:{...answers}, score:total,
         tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
       };
-      persistCase(caseData);
-      setCases(fetchAllCases());
+      if(user && supabase){
+        // signed in → save to cloud profile
+        saveAssessment(caseData, user.id).then(refreshCases).catch(e=>console.warn("[F2F] save failed:",e?.message));
+      } else {
+        // guest → keep local
+        persistCase(caseData); refreshCases();
+      }
     } else {
       setWizStep(s=>Math.min(s+1,TOTAL_WIZ));
     }
@@ -598,6 +730,69 @@ export default function F2FApp(){
   function goPrevWiz(){
     if(wizStep===1){setScreen("home");return;}
     setWizStep(s=>Math.max(s-1,1));
+  }
+
+  /* ── AUTH HANDLERS ── */
+  function openAuth(mode="signin"){
+    setAuthMode(mode); setAuthError(""); setAuthNotice("");
+    setAuthName(""); setAuthEmail(""); setAuthPassword(""); setAuthCode("");
+    setScreen("auth");
+  }
+  async function handleEmailAuth(){
+    if(!supabase) return;
+    setAuthError(""); setAuthLoading(true);
+    try{
+      const email=authEmail.trim().toLowerCase();
+      if(authMode==="signup"){
+        const {error}=await supabase.auth.signUp({
+          email, password:authPassword,
+          options:{ data:{ full_name:authName.trim() } },
+        });
+        if(error) throw error;
+        setAuthMode("otp");
+        setAuthNotice(`We emailed a 6-digit code to ${email}. Enter it below to finish creating your account.`);
+      } else {
+        const {error}=await supabase.auth.signInWithPassword({ email, password:authPassword });
+        if(error) throw error;
+        setScreen("home");
+      }
+    }catch(e){ setAuthError(e?.message||"Something went wrong. Please try again."); }
+    finally{ setAuthLoading(false); }
+  }
+  async function handleVerifyOtp(){
+    if(!supabase) return;
+    setAuthError(""); setAuthLoading(true);
+    try{
+      const {error}=await supabase.auth.verifyOtp({
+        email:authEmail.trim().toLowerCase(), token:authCode.trim(), type:"email",
+      });
+      if(error) throw error;
+      setScreen("home");
+    }catch(e){ setAuthError(e?.message||"That code didn't work. Check it and try again."); }
+    finally{ setAuthLoading(false); }
+  }
+  async function handleResendCode(){
+    if(!supabase) return;
+    setAuthError(""); setAuthNotice("");
+    try{
+      const {error}=await supabase.auth.resend({ type:"signup", email:authEmail.trim().toLowerCase() });
+      if(error) throw error;
+      setAuthNotice("A new code is on its way.");
+    }catch(e){ setAuthError(e?.message||"Couldn't resend the code."); }
+  }
+  async function handleGoogle(){
+    if(!supabase) return;
+    setAuthError("");
+    try{
+      const {error}=await supabase.auth.signInWithOAuth({
+        provider:"google", options:{ redirectTo: window.location.origin },
+      });
+      if(error) throw error;
+    }catch(e){ setAuthError(e?.message||"Google sign-in failed."); }
+  }
+  async function handleSignOut(){
+    if(supabase) await supabase.auth.signOut();
+    setScreen("home");
   }
 
   function handleCopy(){
@@ -611,7 +806,7 @@ export default function F2FApp(){
   }
 
   function exportCSV(){
-    const allCases=fetchAllCases();
+    const allCases=cases;
     if(allCases.length===0) return;
     const csv=buildCSV(allCases);
     const a=document.createElement("a");
@@ -648,7 +843,7 @@ export default function F2FApp(){
       </div>
       <div className="home-btns">
         <button className="home-btn-new" onClick={()=>setScreen("intake")}>New Assessment</button>
-        <button className="home-btn-sec" onClick={()=>{setCases(fetchAllCases());setScreen("records");}}>
+        <button className="home-btn-sec" onClick={()=>{refreshCases();setScreen("records");}}>
           Patient Records {cases.length>0&&`(${cases.length})`}
         </button>
       </div>
@@ -866,11 +1061,19 @@ export default function F2FApp(){
           </div>
 
           <div className="score-wrap">
-            <div className="score-big">{total}</div>
+            <div className="score-big"><AnimatedNumber value={total} reduce={reduce}/></div>
             <div className="score-denom">/ 30 pts</div>
-            <div className="tier-lbl">{tier.label}</div>
-            <div className="tier-headline">{tier.headline}</div>
-            {tier.timing&&<div className="timing">Optimization window · {tier.timing}</div>}
+            <motion.div className="tier-lbl"
+              initial={reduce?false:{opacity:0,y:6}} animate={{opacity:1,y:0}} transition={{delay:0.55,duration:0.4}}>
+              {tier.label}
+            </motion.div>
+            <motion.div className="tier-headline"
+              initial={reduce?false:{opacity:0,y:6}} animate={{opacity:1,y:0}} transition={{delay:0.65,duration:0.4}}>
+              {tier.headline}
+            </motion.div>
+            {tier.timing&&<motion.div className="timing"
+              initial={reduce?false:{opacity:0}} animate={{opacity:1}} transition={{delay:0.78,duration:0.4}}>
+              Optimization window · {tier.timing}</motion.div>}
           </div>
 
           <div style={{marginBottom:20}}>
@@ -900,7 +1103,9 @@ export default function F2FApp(){
                 <div className="b-row" key={d.id}>
                   <span className="b-name">{d.label}</span>
                   <div className="b-right">
-                    <div className="b-bar-wrap"><div className="b-bar-fill" style={{width:`${Math.min((ds/d.maxPts)*100,100)}%`}}/></div>
+                    <div className="b-bar-wrap"><motion.div className="b-bar-fill"
+                      initial={reduce?false:{width:0}} animate={{width:`${Math.min((ds/d.maxPts)*100,100)}%`}}
+                      transition={{duration:0.6,delay:0.2,ease:"easeOut"}}/></div>
                     <span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{d.maxPts}</span></span>
                   </div>
                 </div>
@@ -915,7 +1120,7 @@ export default function F2FApp(){
           <div style={{marginBottom:24}}>
             <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:4}}>Patient-Specific Action Plan</div>
             <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:16}}>{recs.length} item{recs.length!==1?"s":""} · sorted by priority · <span style={{color:"var(--r)"}}>● urgent</span></div>
-            {recs.map((r,i)=><RecCard key={i} rec={r} index={i}/>)}
+            {recs.map((r,i)=><RecCard key={i} rec={r} index={i} reduce={reduce}/>)}
           </div>
 
           <div style={{marginBottom:24}}>
@@ -931,6 +1136,12 @@ export default function F2FApp(){
             })}
           </div>
 
+          {isSupabaseConfigured && !user && (
+            <div className="alert al-dark" style={{marginBottom:12}}>
+              <div className="al-title" style={{color:"var(--k)"}}>Sign in to save</div>
+              <div className="al-body">Create an account to save this assessment to your profile and access it from any device. <button onClick={()=>openAuth("signup")} style={{background:"none",border:"none",color:"var(--k)",fontWeight:600,textDecoration:"underline",textUnderlineOffset:"3px",cursor:"pointer",fontFamily:"var(--sans)",fontSize:"inherit",padding:0}}>Create account →</button></div>
+            </div>
+          )}
           <button className="btn-s" style={{width:"100%",marginBottom:8}} onClick={resetAll}>New Assessment</button>
           <div className="footnote">Research & educational use only · Not a substitute for clinical judgment<br/><strong style={{color:"#b0bec5"}}>Beta v1.1</strong> · Fuenmayor PJ, MD · FSPS 2025</div>
         </div>
@@ -997,7 +1208,7 @@ export default function F2FApp(){
         <div className="caption" style={{marginBottom:4}}>{typeLabel} · {selCase.enrollmentDate}</div>
         <div style={{marginBottom:20}}/> 
         <div className="score-wrap">
-          <div className="score-big">{selCase.score}</div>
+          <div className="score-big"><AnimatedNumber value={selCase.score} reduce={reduce}/></div>
           <div className="score-denom">/ 30 pts</div>
           <div className="tier-lbl">{t.label}</div>
           <div className="tier-headline">{t.headline}</div>
@@ -1006,13 +1217,13 @@ export default function F2FApp(){
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
           {DOMAINS.map(dom=>{
             const ds=d[dom.id]??0;
-            return(<div className="b-row" key={dom.id}><span className="b-name">{dom.label}</span><div className="b-right"><div className="b-bar-wrap"><div className="b-bar-fill" style={{width:`${Math.min((ds/dom.maxPts)*100,100)}%`}}/></div><span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{dom.maxPts}</span></span></div></div>);
+            return(<div className="b-row" key={dom.id}><span className="b-name">{dom.label}</span><div className="b-right"><div className="b-bar-wrap"><motion.div className="b-bar-fill" initial={reduce?false:{width:0}} animate={{width:`${Math.min((ds/dom.maxPts)*100,100)}%`}} transition={{duration:0.6,delay:0.15,ease:"easeOut"}}/></div><span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{dom.maxPts}</span></span></div></div>);
           })}
           <div className="b-total" style={{marginTop:12}}><span className="b-total-lbl">Total F2F Score</span><span className="b-total-pts">{selCase.score} pts</span></div>
         </div>
         <div style={{marginBottom:24}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:16}}>Patient-Specific Action Plan</div>
-          {detailRecs.map((r,i)=><RecCard key={i} rec={r} index={i}/>)}
+          {detailRecs.map((r,i)=><RecCard key={i} rec={r} index={i} reduce={reduce}/>)}
         </div>
       </div>
     );
@@ -1068,6 +1279,106 @@ export default function F2FApp(){
     </div>
   );
 
+  const renderAuth=()=>(
+    <div>
+      <button className="back-link" onClick={()=>setScreen("home")}>← Back</button>
+      {!isSupabaseConfigured ? (
+        <div className="alert al-red"><div className="al-body" style={{color:"var(--r)"}}>Sign-in isn't configured yet — Supabase keys are missing.</div></div>
+      ) : authMode==="otp" ? (
+        <>
+          <div className="eyebrow">Verify Email</div>
+          <div className="auth-title">Enter your code</div>
+          <div className="auth-sub">{authNotice||`We emailed a 6-digit code to ${authEmail}.`}</div>
+          <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength={6}
+            placeholder="------" value={authCode}
+            onChange={e=>setAuthCode(e.target.value.replace(/\D/g,"").slice(0,6))}
+            onKeyDown={e=>{if(e.key==="Enter"&&authCode.length===6)handleVerifyOtp();}}/>
+          {authError&&<div className="alert al-red" style={{marginTop:12}}><div className="al-body" style={{color:"var(--r)"}}>{authError}</div></div>}
+          <button className="btn-p" style={{marginTop:14}} disabled={authLoading||authCode.length<6} onClick={handleVerifyOtp}>
+            {authLoading?"Verifying…":"Verify & Continue →"}
+          </button>
+          <div className="auth-toggle">Didn't get it? <button onClick={handleResendCode}>Resend code</button></div>
+        </>
+      ) : (
+        <>
+          <div className="eyebrow">{authMode==="signup"?"Create Account":"Welcome Back"}</div>
+          <div className="auth-title">{authMode==="signup"?"Create your account":"Sign in"}</div>
+          <div className="auth-sub">{authMode==="signup"?"Save your assessments securely and access them from any device.":"Sign in to access your saved assessments."}</div>
+          <button className="google-btn" onClick={handleGoogle}>
+            <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+              <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.71-1.57 2.68-3.89 2.68-6.62z"/>
+              <path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.81.54-1.85.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33A9 9 0 0 0 9 18z"/>
+              <path fill="#FBBC05" d="M3.96 10.71A5.41 5.41 0 0 1 3.68 9c0-.59.1-1.17.29-1.71V4.96H.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.04l3-2.33z"/>
+              <path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.59C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.96l3 2.33C4.68 5.16 6.66 3.58 9 3.58z"/>
+            </svg>
+            Continue with Google
+          </button>
+          <div className="auth-divider">or</div>
+          {authMode==="signup"&&(
+            <div className="auth-field">
+              <label className="auth-label">Full name</label>
+              <input className="auth-input" type="text" autoComplete="name" placeholder="Dr. Jane Smith"
+                value={authName} onChange={e=>setAuthName(e.target.value)}/>
+            </div>
+          )}
+          <div className="auth-field">
+            <label className="auth-label">Email</label>
+            <input className="auth-input" type="email" autoComplete="email" placeholder="you@hospital.org"
+              value={authEmail} onChange={e=>setAuthEmail(e.target.value)}/>
+          </div>
+          <div className="auth-field">
+            <label className="auth-label">Password</label>
+            <input className="auth-input" type="password" autoComplete={authMode==="signup"?"new-password":"current-password"}
+              placeholder="••••••••" value={authPassword} onChange={e=>setAuthPassword(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter")handleEmailAuth();}}/>
+          </div>
+          {authError&&<div className="alert al-red" style={{marginTop:4,marginBottom:12}}><div className="al-body" style={{color:"var(--r)"}}>{authError}</div></div>}
+          <button className="btn-p"
+            disabled={authLoading||!authEmail||!authPassword||(authMode==="signup"&&!authName)}
+            onClick={handleEmailAuth}>
+            {authLoading?"Please wait…":authMode==="signup"?"Create Account →":"Sign In →"}
+          </button>
+          <div className="auth-toggle">
+            {authMode==="signup"?"Already have an account? ":"New here? "}
+            <button onClick={()=>{setAuthMode(authMode==="signup"?"signin":"signup");setAuthError("");}}>
+              {authMode==="signup"?"Sign in":"Create one"}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+
+  const renderProfile=()=>{
+    if(!user) return(
+      <div>
+        <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
+        <div className="empty-state"><div className="empty-text">Not signed in</div></div>
+        <button className="btn-p" onClick={()=>openAuth("signin")}>Sign In</button>
+      </div>
+    );
+    return(
+      <div>
+        <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
+        <div className="eyebrow">Account</div>
+        <div className="display" style={{marginBottom:16,fontSize:24}}>Profile</div>
+        <div className="profile-card">
+          <div className="profile-avatar">{userInitial}</div>
+          <div>
+            <div className="profile-name">{userName}</div>
+            <div className="profile-email">{user.email}</div>
+          </div>
+        </div>
+        <div style={{marginBottom:20}}>
+          <div className="profile-stat"><span>Saved assessments</span><span className="profile-stat-val">{cases.length}</span></div>
+          <div className="profile-stat"><span>Sign-in method</span><span className="profile-stat-val">{user.app_metadata?.provider||"email"}</span></div>
+        </div>
+        <button className="btn-s" style={{width:"100%",marginBottom:8}} onClick={()=>{refreshCases();setScreen("records");}}>View My Assessments</button>
+        <button className="btn-s" style={{width:"100%"}} onClick={handleSignOut}>Sign Out</button>
+      </div>
+    );
+  };
+
   return(
     <>
       <style>{css}</style>
@@ -1078,19 +1389,34 @@ export default function F2FApp(){
               <div className="hdr-brand">Fitness-to-Flap Score</div>
               <div className="hdr-sub">Pressure Injury Module · Beta v1.1</div>
             </div>
-            {screen==="wizard"&&wizStep<6&&<div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>}
+            {screen==="wizard"&&wizStep<6
+              ? <div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>
+              : isSupabaseConfigured && authReady && (user
+                  ? <button className="hdr-acct" onClick={()=>setScreen("profile")} aria-label="Account">{userInitial}</button>
+                  : <button className="hdr-acct-link" onClick={()=>openAuth("signin")}>Sign in</button>)}
           </div>
           {showProg&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
         </header>
         <main className="main">
-          {screen==="home"       && renderHome()}
-          {screen==="intake"     && renderIntake()}
-          {screen==="id_confirm" && renderIdConfirm()}
-          {screen==="wizard"     && renderWizard()}
-          {screen==="records"    && renderRecords()}
-          {screen==="detail"     && renderDetail()}
-          {screen==="settings"   && renderSettings()}
-          {screen==="about"      && renderAbout()}
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div
+              key={screen==="wizard"?`wizard-${wizStep}`:screen}
+              initial={reduce?{opacity:0}:{opacity:0,y:10}}
+              animate={{opacity:1,y:0}}
+              exit={reduce?{opacity:0}:{opacity:0,y:-8}}
+              transition={{duration:reduce?0.15:0.3,ease:[0.22,0.61,0.36,1]}}>
+              {screen==="home"       && renderHome()}
+              {screen==="intake"     && renderIntake()}
+              {screen==="id_confirm" && renderIdConfirm()}
+              {screen==="wizard"     && renderWizard()}
+              {screen==="records"    && renderRecords()}
+              {screen==="detail"     && renderDetail()}
+              {screen==="settings"   && renderSettings()}
+              {screen==="about"      && renderAbout()}
+              {screen==="auth"       && renderAuth()}
+              {screen==="profile"    && renderProfile()}
+            </motion.div>
+          </AnimatePresence>
         </main>
       </div>
     </>
