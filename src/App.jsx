@@ -453,27 +453,51 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .wh-status{font-size:11px;margin-top:6px;font-family:var(--mono)}
 .wh-ok{color:#16a34a}.wh-fail{color:var(--r)}.wh-none{color:var(--k4)}
 
+/* On mobile the sheet is a transparent pass-through (padding lives on .main) */
+.sheet{width:100%}
+
 /* ═══════════════════════════════════════════════
    RESPONSIVE — Desktop / Tablet web view
-   Mobile-first above; the column becomes a centered
-   editorial panel on larger screens (line length stays
-   readable — correct UX for a clinical form).
+   Full-width top bar + a white content card centered
+   in the viewport (vertically when short, scrolls when
+   tall) on a soft grey backdrop. Single column keeps
+   line length readable — correct UX for a clinical form.
 ═══════════════════════════════════════════════ */
 @media (min-width:768px){
-  body{background:var(--g1)}
-  .app{max-width:600px;min-height:calc(100dvh - 64px);margin:32px auto;
-       border:1px solid var(--g2);box-shadow:0 1px 3px rgba(0,0,0,.06),0 10px 30px rgba(0,0,0,.05)}
-  .hdr{position:static}
-  .main{padding:40px 48px 56px}
-  .home-hero{padding:40px 0 32px}
+  html,body{background:var(--g1)}
+  /* full-viewport shell — no floating card on .app */
+  .app{max-width:none;width:100%;min-height:100dvh;margin:0;border:none;box-shadow:none;background:var(--g1)}
+  /* full-width black top bar; its content capped + centered */
+  .hdr{position:sticky;top:0;padding:16px 32px}
+  .hdr-row{max-width:1080px;margin:0 auto;width:100%}
+  /* grey region that centers the white card */
+  .main{flex:1;display:flex;flex-direction:column;align-items:center;padding:32px 24px;background:var(--g1)}
+  /* the centered content card — margin:auto centers it vertically when short,
+     scrolls without clipping when tall */
+  .sheet{max-width:520px;margin:auto;background:var(--w);border:1px solid var(--g2);
+         box-shadow:0 1px 3px rgba(0,0,0,.06),0 10px 30px rgba(0,0,0,.05);padding:40px 44px}
+  .sheet-wide{max-width:680px}
+  /* size bumps */
+  .home-hero{padding:36px 0 30px}
   .home-title{font-size:44px}
   .home-sub{max-width:320px}
   .display{font-size:34px}
   .domain-title{font-size:32px}
+  .auth-brand{font-size:46px}
 }
 @media (min-width:1024px){
-  .app{max-width:640px;margin:48px auto;min-height:calc(100dvh - 96px)}
-  .main{padding:48px 56px 64px}
+  .main{padding:40px 32px}
+  .sheet{max-width:540px;padding:44px 48px}
+  .sheet-wide{max-width:700px}
+}
+@media (min-width:1440px){
+  .main{padding:52px 32px}
+  .sheet{max-width:560px;padding:48px 52px}
+  .sheet-wide{max-width:760px}
+  .auth-brand{font-size:50px}
+  .home-title{font-size:48px}
+  .display{font-size:36px}
+  .domain-title{font-size:34px}
 }
 
 /* ═══════════════════════════════════════════════
@@ -1500,6 +1524,7 @@ export default function F2FApp(){
           {showProg&&!showLanding&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
         </header>
         <main className="main">
+          <div className={`sheet ${["records","detail"].includes(screen)||(screen==="wizard"&&wizStep===6)?"sheet-wide":""}`}>
           {booting ? (
             <div className="boot"><div className="boot-mark">F2F</div></div>
           ) : (
@@ -1531,6 +1556,7 @@ export default function F2FApp(){
               )}
             </AnimatePresence>
           )}
+          </div>
         </main>
       </div>
     </>
