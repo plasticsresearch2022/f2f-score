@@ -518,6 +518,27 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .profile-email{font-size:12.5px;color:var(--k4);margin-top:2px}
 .profile-stat{display:flex;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--g1);font-size:13px;color:var(--k2)}
 .profile-stat-val{font-family:var(--mono);color:var(--k)}
+
+/* ── Sign-in landing ── */
+.auth-screen{padding-top:6px}
+.auth-hero{text-align:center;margin-bottom:26px}
+.auth-brand{font-family:var(--serif);font-style:italic;font-size:40px;letter-spacing:-.025em;color:var(--k);line-height:1.05}
+.auth-tagline{font-size:12.5px;color:var(--k4);margin-top:8px;line-height:1.55;max-width:290px;margin-left:auto;margin-right:auto}
+.auth-foot{margin-top:26px;text-align:center}
+.auth-guest{background:none;border:none;color:var(--k3);font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:4px;padding:8px;transition:color .12s}
+.auth-guest:hover{color:var(--k)}
+.auth-disclaimer{font-size:10.5px;color:var(--g3);margin-top:16px;line-height:1.6}
+
+/* ── One-field-at-a-time domain progress dots ── */
+.field-dots{display:flex;gap:6px;margin:14px 0 22px}
+.field-dot{width:6px;height:6px;border-radius:50%;background:var(--g3);transition:background .2s ease,transform .2s ease}
+.field-dot.done{background:var(--k3)}
+.field-dot.active{background:var(--k);transform:scale(1.35)}
+
+/* ── Boot splash ── */
+.boot{min-height:50vh;display:flex;align-items:center;justify-content:center}
+.boot-mark{font-family:var(--serif);font-style:italic;font-size:40px;color:var(--g3);animation:bootpulse 1.2s ease-in-out infinite}
+@keyframes bootpulse{0%,100%{opacity:.4}50%{opacity:.9}}
 `;
 
 /* ═══════════════════════════════════════════════
@@ -625,6 +646,8 @@ export default function F2FApp(){
   const [authLoading,  setAuthLoading]  = useState(false);
   const [authError,    setAuthError]    = useState("");
   const [authNotice,   setAuthNotice]   = useState("");
+  const [guest,        setGuest]        = useState(false); // chose "continue as guest"
+  const [fieldIdx,     setFieldIdx]     = useState(0);     // one-field-at-a-time within a domain
 
   // Load settings on mount (assessments are loaded by the [user] effect below)
   useEffect(()=>{
@@ -680,8 +703,18 @@ export default function F2FApp(){
   const {total,ciFlags,domainScores}=useMemo(()=>computeScore(answers),[answers]);
   const tier=getTier(total);
   const recs=useMemo(()=>buildRecs(answers,tier.id),[answers,tier.id]);
-  const pct=wizStep===1?0:Math.round((wizStep/TOTAL_WIZ)*100);
+  // Field-aware progress: smooth advance per question within each domain
+  const pct=useMemo(()=>{
+    if(wizStep===1) return 6;
+    if(wizStep>=6) return 100;
+    const nf=domain?domain.fields.length:1;
+    const frac=((wizStep-2)+(fieldIdx/nf))/4; // 0..1 across 4 domains
+    return Math.round(10+frac*86);
+  },[wizStep,fieldIdx,domain]);
   const assessLabel=TYPE_LABELS[assessType]||"New Patient";
+
+  // Reset to first question whenever we enter/leave a domain step
+  useEffect(()=>{ setFieldIdx(0); },[wizStep]);
 
   /* ── HANDLERS ── */
   async function handleGenerateId(){
@@ -700,8 +733,23 @@ export default function F2FApp(){
 
   function handleBeginAssessment(){
     if(!deIdDone) return;
-    setWizStep(1); setCiChecked({}); setAnswers({});
+    setWizStep(1); setCiChecked({}); setAnswers({}); setFieldIdx(0);
     setCopied(false); setCopyFallback(false); setScreen("wizard");
+  }
+
+  function continueAsGuest(){ setGuest(true); setScreen("home"); }
+
+  // One-field-at-a-time navigation within a domain
+  function nextField(){
+    if(!domain) return;
+    const f=domain.fields[fieldIdx];
+    if(!f || answers[f.id]===undefined) return;       // require an answer
+    if(fieldIdx < domain.fields.length-1) setFieldIdx(i=>i+1);
+    else goNextWiz();                                  // last field → next section (effect resets fieldIdx)
+  }
+  function prevField(){
+    if(fieldIdx>0) setFieldIdx(i=>i-1);
+    else goPrevWiz();
   }
 
   function goNextWiz(){
@@ -831,6 +879,9 @@ export default function F2FApp(){
 
   const grouped = useMemo(()=>groupCasesByStudyId(cases),[cases]);
   const showProg=screen==="wizard"&&wizStep<6;
+  // Sign-in is the primary landing screen until the user signs in OR chooses guest
+  const booting     = isSupabaseConfigured && !authReady;
+  const showLanding = isSupabaseConfigured && authReady && !user && !guest;
 
   /* ══════════════════════════════════════════
      SCREENS
@@ -1027,31 +1078,44 @@ export default function F2FApp(){
         </div>
       )}
 
-      {wizStep>=2&&wizStep<=5&&domain&&(
-        <div>
-          <div className="domain-tag">Domain {wizStep-1} of 4</div>
-          <div className="domain-title">{domain.label}</div>
-          <div className="domain-meta">Max {domain.maxPts} pts · Complete all fields to continue</div>
-          {domain.fields.map(f=>f.type==="radio"
-            ?<RadioField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
-            :<ToggleField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
-          )}
-          {isDomainComplete&&(
-            <div className="domain-preview">
-              <span className="dp-label">Domain score</span>
-              <span className="dp-score">{domainScores[domain.id]??0} / {domain.maxPts} pts</span>
+      {wizStep>=2&&wizStep<=5&&domain&&(()=>{
+        const safeIdx=Math.min(fieldIdx,domain.fields.length-1);
+        const field=domain.fields[safeIdx];
+        const nFields=domain.fields.length;
+        const answered=field?answers[field.id]!==undefined:false;
+        const isLast=safeIdx>=nFields-1;
+        return (
+          <div>
+            <div className="domain-tag">Domain {wizStep-1} of 4 · {domain.label}</div>
+            <div className="domain-title">{domain.label}</div>
+            <div className="domain-meta">Question {safeIdx+1} of {nFields} · Max {domain.maxPts} pts</div>
+            <div className="field-dots">
+              {domain.fields.map((f,i)=>(
+                <span key={f.id} className={`field-dot ${i===safeIdx?"active":""} ${answers[f.id]!==undefined?"done":""}`}/>
+              ))}
             </div>
-          )}
-          <div className="btn-row">
-            <button className="btn-s" onClick={goPrevWiz}>← Back</button>
-            <button className="btn-p" style={{flex:2,background:isDomainComplete?"var(--k)":"#94a3b8"}}
-              disabled={!isDomainComplete} onClick={goNextWiz}>
-              {wizStep===5?"Calculate Score →":"Next →"}
-            </button>
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div key={`${wizStep}-${safeIdx}`}
+                initial={reduce?{opacity:0}:{opacity:0,x:26}}
+                animate={{opacity:1,x:0}}
+                exit={reduce?{opacity:0}:{opacity:0,x:-26}}
+                transition={{duration:reduce?0.12:0.3,ease:[0.22,0.61,0.36,1]}}>
+                {field.type==="radio"
+                  ?<RadioField field={field} value={answers[field.id]} onChange={updateAnswer}/>
+                  :<ToggleField field={field} value={answers[field.id]} onChange={updateAnswer}/>}
+              </motion.div>
+            </AnimatePresence>
+            <div className="btn-row">
+              <button className="btn-s" onClick={prevField}>← Back</button>
+              <button className="btn-p" style={{flex:2,background:answered?"var(--k)":"#94a3b8"}}
+                disabled={!answered} onClick={nextField}>
+                {isLast?(wizStep===5?"Calculate Score →":"Next Section →"):"Next →"}
+              </button>
+            </div>
+            {!answered&&<div style={{textAlign:"center",fontSize:12,color:"#94a3b8",marginTop:8}}>Select an option to continue</div>}
           </div>
-          {!isDomainComplete&&<div style={{textAlign:"center",fontSize:12,color:"#94a3b8",marginTop:8}}>Complete all selections to continue</div>}
-        </div>
-      )}
+        );
+      })()}
 
       {wizStep===6&&(
         <div>
@@ -1279,75 +1343,106 @@ export default function F2FApp(){
     </div>
   );
 
-  const renderAuth=()=>(
-    <div>
-      <button className="back-link" onClick={()=>setScreen("home")}>← Back</button>
-      {!isSupabaseConfigured ? (
-        <div className="alert al-red"><div className="al-body" style={{color:"var(--r)"}}>Sign-in isn't configured yet — Supabase keys are missing.</div></div>
-      ) : authMode==="otp" ? (
-        <>
-          <div className="eyebrow">Verify Email</div>
-          <div className="auth-title">Enter your code</div>
-          <div className="auth-sub">{authNotice||`We emailed a 6-digit code to ${authEmail}.`}</div>
-          <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength={6}
-            placeholder="------" value={authCode}
-            onChange={e=>setAuthCode(e.target.value.replace(/\D/g,"").slice(0,6))}
-            onKeyDown={e=>{if(e.key==="Enter"&&authCode.length===6)handleVerifyOtp();}}/>
-          {authError&&<div className="alert al-red" style={{marginTop:12}}><div className="al-body" style={{color:"var(--r)"}}>{authError}</div></div>}
-          <button className="btn-p" style={{marginTop:14}} disabled={authLoading||authCode.length<6} onClick={handleVerifyOtp}>
-            {authLoading?"Verifying…":"Verify & Continue →"}
-          </button>
-          <div className="auth-toggle">Didn't get it? <button onClick={handleResendCode}>Resend code</button></div>
-        </>
-      ) : (
-        <>
-          <div className="eyebrow">{authMode==="signup"?"Create Account":"Welcome Back"}</div>
-          <div className="auth-title">{authMode==="signup"?"Create your account":"Sign in"}</div>
-          <div className="auth-sub">{authMode==="signup"?"Save your assessments securely and access them from any device.":"Sign in to access your saved assessments."}</div>
-          <button className="google-btn" onClick={handleGoogle}>
-            <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-              <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.71-1.57 2.68-3.89 2.68-6.62z"/>
-              <path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.81.54-1.85.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33A9 9 0 0 0 9 18z"/>
-              <path fill="#FBBC05" d="M3.96 10.71A5.41 5.41 0 0 1 3.68 9c0-.59.1-1.17.29-1.71V4.96H.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.04l3-2.33z"/>
-              <path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.59C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.96l3 2.33C4.68 5.16 6.66 3.58 9 3.58z"/>
-            </svg>
-            Continue with Google
-          </button>
-          <div className="auth-divider">or</div>
-          {authMode==="signup"&&(
-            <div className="auth-field">
-              <label className="auth-label">Full name</label>
-              <input className="auth-input" type="text" autoComplete="name" placeholder="Dr. Jane Smith"
-                value={authName} onChange={e=>setAuthName(e.target.value)}/>
-            </div>
-          )}
-          <div className="auth-field">
-            <label className="auth-label">Email</label>
-            <input className="auth-input" type="email" autoComplete="email" placeholder="you@hospital.org"
-              value={authEmail} onChange={e=>setAuthEmail(e.target.value)}/>
-          </div>
-          <div className="auth-field">
-            <label className="auth-label">Password</label>
-            <input className="auth-input" type="password" autoComplete={authMode==="signup"?"new-password":"current-password"}
-              placeholder="••••••••" value={authPassword} onChange={e=>setAuthPassword(e.target.value)}
-              onKeyDown={e=>{if(e.key==="Enter")handleEmailAuth();}}/>
-          </div>
-          {authError&&<div className="alert al-red" style={{marginTop:4,marginBottom:12}}><div className="al-body" style={{color:"var(--r)"}}>{authError}</div></div>}
-          <button className="btn-p"
-            disabled={authLoading||!authEmail||!authPassword||(authMode==="signup"&&!authName)}
-            onClick={handleEmailAuth}>
-            {authLoading?"Please wait…":authMode==="signup"?"Create Account →":"Sign In →"}
-          </button>
-          <div className="auth-toggle">
-            {authMode==="signup"?"Already have an account? ":"New here? "}
-            <button onClick={()=>{setAuthMode(authMode==="signup"?"signin":"signup");setAuthError("");}}>
-              {authMode==="signup"?"Sign in":"Create one"}
-            </button>
-          </div>
-        </>
-      )}
-    </div>
+  const GoogleG=()=>(
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+      <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.71-1.57 2.68-3.89 2.68-6.62z"/>
+      <path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.81.54-1.85.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33A9 9 0 0 0 9 18z"/>
+      <path fill="#FBBC05" d="M3.96 10.71A5.41 5.41 0 0 1 3.68 9c0-.59.1-1.17.29-1.71V4.96H.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.04l3-2.33z"/>
+      <path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.59C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.96l3 2.33C4.68 5.16 6.66 3.58 9 3.58z"/>
+    </svg>
   );
+
+  const renderAuth=()=>{
+    const landing = !user && !guest;
+    const fade=(d=0)=> reduce
+      ? {}
+      : {initial:{opacity:0,y:14},animate:{opacity:1,y:0},transition:{duration:0.5,delay:d,ease:[0.22,0.61,0.36,1]}};
+    if(!isSupabaseConfigured){
+      return (
+        <div>
+          <button className="back-link" onClick={()=>setScreen("home")}>← Back</button>
+          <div className="alert al-red"><div className="al-body" style={{color:"var(--r)"}}>Sign-in isn't configured yet — Supabase keys are missing.</div></div>
+        </div>
+      );
+    }
+    return (
+      <div className="auth-screen">
+        <motion.div className="auth-hero" {...fade(0)}>
+          <div className="auth-brand">Fitness-to-Flap</div>
+          <div className="auth-tagline">Pre-operative risk stratification for flap reconstruction</div>
+        </motion.div>
+
+        <AnimatePresence mode="wait" initial={false}>
+          <motion.div key={authMode==="otp"?"otp":"form"}
+            initial={reduce?{opacity:0}:{opacity:0,y:10}}
+            animate={{opacity:1,y:0}}
+            exit={reduce?{opacity:0}:{opacity:0,y:-10}}
+            transition={{duration:reduce?0.12:0.26,ease:[0.22,0.61,0.36,1]}}>
+            {authMode==="otp" ? (
+              <div>
+                <div className="auth-title" style={{fontSize:26}}>Check your email</div>
+                <div className="auth-sub">{authNotice||`We emailed a 6-digit code to ${authEmail}.`}</div>
+                <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength={6}
+                  placeholder="------" value={authCode}
+                  onChange={e=>setAuthCode(e.target.value.replace(/\D/g,"").slice(0,6))}
+                  onKeyDown={e=>{if(e.key==="Enter"&&authCode.length===6)handleVerifyOtp();}}/>
+                {authError&&<div className="alert al-red" style={{marginTop:12}}><div className="al-body" style={{color:"var(--r)"}}>{authError}</div></div>}
+                <button className="btn-p" style={{marginTop:14}} disabled={authLoading||authCode.length<6} onClick={handleVerifyOtp}>
+                  {authLoading?"Verifying…":"Verify & Continue →"}
+                </button>
+                <div className="auth-toggle">
+                  Didn't get it? <button onClick={handleResendCode}>Resend code</button>
+                  {" · "}<button onClick={()=>{setAuthMode("signup");setAuthError("");setAuthNotice("");}}>Different email</button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <button className="google-btn" onClick={handleGoogle}><GoogleG/> Continue with Google</button>
+                <div className="auth-divider">or {authMode==="signup"?"sign up":"sign in"} with email</div>
+                {authMode==="signup"&&(
+                  <div className="auth-field">
+                    <label className="auth-label">Full name</label>
+                    <input className="auth-input" type="text" autoComplete="name" placeholder="Dr. Jane Smith"
+                      value={authName} onChange={e=>setAuthName(e.target.value)}/>
+                  </div>
+                )}
+                <div className="auth-field">
+                  <label className="auth-label">Email</label>
+                  <input className="auth-input" type="email" autoComplete="email" placeholder="you@hospital.org"
+                    value={authEmail} onChange={e=>setAuthEmail(e.target.value)}/>
+                </div>
+                <div className="auth-field">
+                  <label className="auth-label">Password</label>
+                  <input className="auth-input" type="password" autoComplete={authMode==="signup"?"new-password":"current-password"}
+                    placeholder="••••••••" value={authPassword} onChange={e=>setAuthPassword(e.target.value)}
+                    onKeyDown={e=>{if(e.key==="Enter")handleEmailAuth();}}/>
+                </div>
+                {authError&&<div className="alert al-red" style={{marginTop:4,marginBottom:12}}><div className="al-body" style={{color:"var(--r)"}}>{authError}</div></div>}
+                <button className="btn-p"
+                  disabled={authLoading||!authEmail||!authPassword||(authMode==="signup"&&!authName)}
+                  onClick={handleEmailAuth}>
+                  {authLoading?"Please wait…":authMode==="signup"?"Create Account →":"Sign In →"}
+                </button>
+                <div className="auth-toggle">
+                  {authMode==="signup"?"Already have an account? ":"New here? "}
+                  <button onClick={()=>{setAuthMode(authMode==="signup"?"signin":"signup");setAuthError("");}}>
+                    {authMode==="signup"?"Sign in":"Create one"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </motion.div>
+        </AnimatePresence>
+
+        <motion.div className="auth-foot" {...fade(0.22)}>
+          {landing
+            ? <button className="auth-guest" onClick={continueAsGuest}>Continue as guest →</button>
+            : <button className="back-link" style={{margin:0,justifyContent:"center"}} onClick={()=>setScreen("home")}>← Back</button>}
+          <div className="auth-disclaimer">For research &amp; educational use only · Not a substitute for clinical judgment</div>
+        </motion.div>
+      </div>
+    );
+  };
 
   const renderProfile=()=>{
     if(!user) return(
@@ -1391,31 +1486,44 @@ export default function F2FApp(){
             </div>
             {screen==="wizard"&&wizStep<6
               ? <div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>
-              : isSupabaseConfigured && authReady && (user
+              : (!showLanding && !booting && isSupabaseConfigured && authReady && (user
                   ? <button className="hdr-acct" onClick={()=>setScreen("profile")} aria-label="Account">{userInitial}</button>
-                  : <button className="hdr-acct-link" onClick={()=>openAuth("signin")}>Sign in</button>)}
+                  : <button className="hdr-acct-link" onClick={()=>openAuth("signin")}>Sign in</button>))}
           </div>
-          {showProg&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
+          {showProg&&!showLanding&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
         </header>
         <main className="main">
           <AnimatePresence mode="wait" initial={false}>
-            <motion.div
-              key={screen==="wizard"?`wizard-${wizStep}`:screen}
-              initial={reduce?{opacity:0}:{opacity:0,y:10}}
-              animate={{opacity:1,y:0}}
-              exit={reduce?{opacity:0}:{opacity:0,y:-8}}
-              transition={{duration:reduce?0.15:0.3,ease:[0.22,0.61,0.36,1]}}>
-              {screen==="home"       && renderHome()}
-              {screen==="intake"     && renderIntake()}
-              {screen==="id_confirm" && renderIdConfirm()}
-              {screen==="wizard"     && renderWizard()}
-              {screen==="records"    && renderRecords()}
-              {screen==="detail"     && renderDetail()}
-              {screen==="settings"   && renderSettings()}
-              {screen==="about"      && renderAbout()}
-              {screen==="auth"       && renderAuth()}
-              {screen==="profile"    && renderProfile()}
-            </motion.div>
+            {booting ? (
+              <motion.div key="booting" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
+                transition={{duration:0.2}} className="boot">
+                <div className="boot-mark">F2F</div>
+              </motion.div>
+            ) : showLanding ? (
+              <motion.div key="landing"
+                initial={reduce?{opacity:0}:{opacity:0,y:10}} animate={{opacity:1,y:0}} exit={{opacity:0}}
+                transition={{duration:reduce?0.15:0.35,ease:[0.22,0.61,0.36,1]}}>
+                {renderAuth()}
+              </motion.div>
+            ) : (
+              <motion.div
+                key={screen==="wizard"?`wizard-${wizStep}`:screen}
+                initial={reduce?{opacity:0}:{opacity:0,y:10}}
+                animate={{opacity:1,y:0}}
+                exit={reduce?{opacity:0}:{opacity:0,y:-8}}
+                transition={{duration:reduce?0.15:0.3,ease:[0.22,0.61,0.36,1]}}>
+                {screen==="home"       && renderHome()}
+                {screen==="intake"     && renderIntake()}
+                {screen==="id_confirm" && renderIdConfirm()}
+                {screen==="wizard"     && renderWizard()}
+                {screen==="records"    && renderRecords()}
+                {screen==="detail"     && renderDetail()}
+                {screen==="settings"   && renderSettings()}
+                {screen==="about"      && renderAbout()}
+                {screen==="auth"       && renderAuth()}
+                {screen==="profile"    && renderProfile()}
+              </motion.div>
+            )}
           </AnimatePresence>
         </main>
       </div>
