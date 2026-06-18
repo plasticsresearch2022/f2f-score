@@ -655,12 +655,19 @@ export default function F2FApp(){
     setWebhookUrl(url); setWebhookInput(url);
   },[]);
 
-  // Subscribe to Supabase auth session
+  // Subscribe to Supabase auth session (authReady is made bulletproof:
+  // resolves via finally + a hard timeout so the UI can never hang on boot)
   useEffect(()=>{
     if(!supabase){ setAuthReady(true); return; }
-    supabase.auth.getSession().then(({data})=>{ setSession(data.session); setAuthReady(true); });
-    const {data:sub}=supabase.auth.onAuthStateChange((_evt,s)=>setSession(s));
-    return ()=>sub.subscription.unsubscribe();
+    let settled=false;
+    const finish=()=>{ if(!settled){ settled=true; setAuthReady(true); } };
+    supabase.auth.getSession()
+      .then(({data})=>{ setSession(data.session); })
+      .catch((e)=>{ console.warn("[F2F] getSession failed:",e?.message); })
+      .finally(finish);
+    const t=setTimeout(finish,2500); // never block the app on auth more than 2.5s
+    const {data:sub}=supabase.auth.onAuthStateChange((_evt,s)=>{ setSession(s); finish(); });
+    return ()=>{ clearTimeout(t); sub.subscription.unsubscribe(); };
   },[]);
 
   const user     = session?.user ?? null;
@@ -1493,38 +1500,37 @@ export default function F2FApp(){
           {showProg&&!showLanding&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
         </header>
         <main className="main">
-          <AnimatePresence mode="wait" initial={false}>
-            {booting ? (
-              <motion.div key="booting" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
-                transition={{duration:0.2}} className="boot">
-                <div className="boot-mark">F2F</div>
-              </motion.div>
-            ) : showLanding ? (
-              <motion.div key="landing"
-                initial={reduce?{opacity:0}:{opacity:0,y:10}} animate={{opacity:1,y:0}} exit={{opacity:0}}
-                transition={{duration:reduce?0.15:0.35,ease:[0.22,0.61,0.36,1]}}>
-                {renderAuth()}
-              </motion.div>
-            ) : (
-              <motion.div
-                key={screen==="wizard"?`wizard-${wizStep}`:screen}
-                initial={reduce?{opacity:0}:{opacity:0,y:10}}
-                animate={{opacity:1,y:0}}
-                exit={reduce?{opacity:0}:{opacity:0,y:-8}}
-                transition={{duration:reduce?0.15:0.3,ease:[0.22,0.61,0.36,1]}}>
-                {screen==="home"       && renderHome()}
-                {screen==="intake"     && renderIntake()}
-                {screen==="id_confirm" && renderIdConfirm()}
-                {screen==="wizard"     && renderWizard()}
-                {screen==="records"    && renderRecords()}
-                {screen==="detail"     && renderDetail()}
-                {screen==="settings"   && renderSettings()}
-                {screen==="about"      && renderAbout()}
-                {screen==="auth"       && renderAuth()}
-                {screen==="profile"    && renderProfile()}
-              </motion.div>
-            )}
-          </AnimatePresence>
+          {booting ? (
+            <div className="boot"><div className="boot-mark">F2F</div></div>
+          ) : (
+            <AnimatePresence mode="wait" initial={false}>
+              {showLanding ? (
+                <motion.div key="landing"
+                  initial={reduce?{opacity:0}:{opacity:0,y:10}} animate={{opacity:1,y:0}} exit={{opacity:0}}
+                  transition={{duration:reduce?0.15:0.35,ease:[0.22,0.61,0.36,1]}}>
+                  {renderAuth()}
+                </motion.div>
+              ) : (
+                <motion.div
+                  key={screen==="wizard"?`wizard-${wizStep}`:screen}
+                  initial={reduce?{opacity:0}:{opacity:0,y:10}}
+                  animate={{opacity:1,y:0}}
+                  exit={reduce?{opacity:0}:{opacity:0,y:-8}}
+                  transition={{duration:reduce?0.15:0.3,ease:[0.22,0.61,0.36,1]}}>
+                  {screen==="home"       && renderHome()}
+                  {screen==="intake"     && renderIntake()}
+                  {screen==="id_confirm" && renderIdConfirm()}
+                  {screen==="wizard"     && renderWizard()}
+                  {screen==="records"    && renderRecords()}
+                  {screen==="detail"     && renderDetail()}
+                  {screen==="settings"   && renderSettings()}
+                  {screen==="about"      && renderAbout()}
+                  {screen==="auth"       && renderAuth()}
+                  {screen==="profile"    && renderProfile()}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          )}
         </main>
       </div>
     </>
