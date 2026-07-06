@@ -1,8 +1,12 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useRef } from "react";
 
 /* ═══════════════════════════════════════════════
-   HOSPITALS
+   NOTE: This artifact uses session memory only.
+   Data clears when the app reloads. Use the
+   Vercel deployment for full persistence.
+   Copy Results after each session to capture data.
 ═══════════════════════════════════════════════ */
+
 const HOSPITALS = [
   { id:"LCH", name:"Larkin Community Hospital",             short:"Larkin"   },
   { id:"PGH", name:"Palmetto General Hospital",             short:"Palmetto" },
@@ -12,89 +16,54 @@ const HOSPITALS = [
 ];
 
 /* ═══════════════════════════════════════════════
-   LOCALSTORAGE UTILITIES
-   All data persists across sessions.
-   Keys prefixed with f2f_ to avoid conflicts.
+   COPY RESULTS UTILITY
 ═══════════════════════════════════════════════ */
-function lsGet(key) {
-  try { return localStorage.getItem(key); } catch(e) { return null; }
-}
-function lsSet(key, val) {
-  try { localStorage.setItem(key, String(val)); return true; } catch(e) { return false; }
-}
-function lsKeys(prefix) {
-  try { return Object.keys(localStorage).filter(k => k.startsWith(prefix)); } catch(e) { return []; }
-}
-function lsDel(key) {
-  try { localStorage.removeItem(key); return true; } catch(e) { return false; }
+function buildCopyText(studyId, hospital, enrollDate, answers, score, tier, domainScores, assessmentType="New Patient") {
+  const a = answers;
+  const csvRow = [
+    studyId, hospital, enrollDate,
+    a.albumin||"", a.prealbumin||"", a.bmi||"", a.pct||"", a.inflammation?"Y":"N",
+    a.location||"", a.woundSize||"", a.osteomyelitis||"", a.priorFlap||"",
+    a.soiling||"", a.irradiated?"Y":"N",
+    a.diabetes||"", a.smoking||"", a.cardio||"", a.steroids?"Y":"N",
+    a.selfReposition||"", a.pressureSurface?"Y":"N", a.socialSupport||"",
+    domainScores.bio??0, domainScores.wound??0, domainScores.comorbidities??0,
+    domainScores.functional??0, score, tier.label, new Date().toISOString()
+  ].map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",");
+
+  return [
+    "=== F2F SCORE RESULT ===",
+    `Study ID:        ${studyId}`,
+    `Assessment Type: ${assessmentType}`,
+    `Hospital:        ${hospital}`,
+    `Date:            ${enrollDate}`,
+    `Score:           ${score} / 30 pts`,
+    `Risk Tier:       ${tier.label}`,
+    "",
+    "Domain Scores:",
+    `  Biomarkers & Nutrition:    ${domainScores.bio??0} / 9`,
+    `  Wound Factors:             ${domainScores.wound??0} / 9`,
+    `  Comorbidities:             ${domainScores.comorbidities??0} / 6`,
+    `  Functional & Social:       ${domainScores.functional??0} / 6`,
+    "",
+    `Recommendation: ${tier.headline}`,
+    tier.timing ? `Optimization window: ${tier.timing}` : "",
+    "",
+    "--- CSV ROW — PASTE INTO RESEARCH SPREADSHEET ---",
+    csvRow,
+  ].filter(l=>l!==undefined).join("\n");
 }
 
-function generateStudyId(hospitalId) {
-  const key = `f2f_counter_${hospitalId}`;
-  let count = parseInt(lsGet(key) || "0");
-  count++;
-  lsSet(key, String(count));
-  return `${hospitalId}-${String(count).padStart(3, "0")}`;
-}
-
-function persistCase(data) {
-  // Key includes studyId + timestamp so multiple assessments per patient are stored separately
-  const key = `f2f_case_${data.studyId}_${Date.now()}`;
-  lsSet(key, JSON.stringify(data));
-}
-
-function fetchAllCases() {
-  const keys = lsKeys("f2f_case_");
-  const cases = keys.map(k => {
-    try { return JSON.parse(lsGet(k)); } catch(e) { return null; }
-  }).filter(Boolean);
-  return cases.sort((a, b) => new Date(b.savedAt) - new Date(a.savedAt));
-}
-
-function groupCasesByStudyId(cases) {
-  const groups = {};
-  cases.forEach(c => {
-    if (!groups[c.studyId]) groups[c.studyId] = [];
-    groups[c.studyId].push(c);
-  });
-  Object.values(groups).forEach(g =>
-    g.sort((a, b) => new Date(a.savedAt) - new Date(b.savedAt))
-  );
-  return Object.entries(groups).sort((a, b) => {
-    const aLatest = Math.max(...a[1].map(c => new Date(c.savedAt)));
-    const bLatest = Math.max(...b[1].map(c => new Date(c.savedAt)));
-    return bLatest - aLatest;
-  });
-}
-
-async function callWebhook(webhookUrl, studyId, hospital, date) {
-  if (!webhookUrl) return "no_url";
-  try {
-    const resp = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        study_id: studyId,
-        hospital: hospital,
-        enrollment_date: date,
-        timestamp: new Date().toISOString(),
-      }),
-    });
-    return resp.ok ? "success" : "failed";
-  } catch(e) { return "failed"; }
-}
-
-function buildCSV(cases) {
+function buildSessionCSV(cases) {
   const H = ["Study ID","Assessment Type","Hospital","Enrollment Date",
     "Albumin","Prealbumin","BMI/Weight Loss","PCT","Inflammatory Markers",
     "PI Location","Wound Size","Osteomyelitis","Prior Flap","Soiling","Irradiated Bed",
     "Diabetes HbA1c","Smoking","Cardiopulmonary/Renal","Chronic Steroids",
     "Self-Repositioning","No Pressure Surface","Social Support",
     "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier","Timestamp"];
-  const rows = cases.map(c => {
-    const a = c.answers||{}; const d = c.domainScores||{};
-    const typeLabel = {new:"New Patient",reassessment:"Re-Assessment",preop:"Pre-Operative"}[c.assessmentType]||"New Patient";
-    return [c.studyId, typeLabel, c.hospital, c.enrollmentDate,
+  const rows = cases.map(c=>{
+    const a=c.answers||{}; const d=c.domainScores||{};
+    return [c.studyId,c.assessmentType||"New Patient",c.hospital,c.enrollmentDate,
       a.albumin||"",a.prealbumin||"",a.bmi||"",a.pct||"",a.inflammation?"Y":"N",
       a.location||"",a.woundSize||"",a.osteomyelitis||"",a.priorFlap||"",a.soiling||"",a.irradiated?"Y":"N",
       a.diabetes||"",a.smoking||"",a.cardio||"",a.steroids?"Y":"N",
@@ -102,41 +71,6 @@ function buildCSV(cases) {
       d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,c.savedAt];
   });
   return [H,...rows].map(r=>r.map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",")).join("\n");
-}
-
-function buildCopyText(studyId, hospital, enrollDate, answers, score, tier, domainScores, assessType="New Patient") {
-  const a = answers;
-  const csvRow = [
-    studyId, assessType, hospital, enrollDate,
-    a.albumin||"",a.prealbumin||"",a.bmi||"",a.pct||"",a.inflammation?"Y":"N",
-    a.location||"",a.woundSize||"",a.osteomyelitis||"",a.priorFlap||"",a.soiling||"",a.irradiated?"Y":"N",
-    a.diabetes||"",a.smoking||"",a.cardio||"",a.steroids?"Y":"N",
-    a.selfReposition||"",a.pressureSurface?"Y":"N",a.socialSupport||"",
-    domainScores.bio??0,domainScores.wound??0,domainScores.comorbidities??0,domainScores.functional??0,
-    score,tier.label,new Date().toISOString()
-  ].map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",");
-
-  return [
-    "=== F2F SCORE RESULT ===",
-    `Study ID:        ${studyId}`,
-    `Assessment Type: ${assessType}`,
-    `Hospital:        ${hospital}`,
-    `Date:            ${enrollDate}`,
-    `Score:           ${score} / 30 pts`,
-    `Risk Tier:       ${tier.label}`,
-    "",
-    "Domain Scores:",
-    `  Biomarkers & Nutrition:  ${domainScores.bio??0} / 9`,
-    `  Wound Factors:           ${domainScores.wound??0} / 9`,
-    `  Comorbidities:           ${domainScores.comorbidities??0} / 6`,
-    `  Functional & Social:     ${domainScores.functional??0} / 6`,
-    "",
-    `Recommendation: ${tier.headline}`,
-    tier.timing ? `Optimization window: ${tier.timing}` : "",
-    "",
-    "--- CSV ROW FOR RESEARCH SPREADSHEET ---",
-    csvRow,
-  ].filter(Boolean).join("\n");
 }
 
 /* ═══════════════════════════════════════════════
@@ -261,7 +195,7 @@ function computeScore(answers) {
     for (const f of domain.fields) {
       const val=answers[f.id];
       if(f.type==="toggle"){ ds+=val===true?f.pts:0; }
-      else {
+      else{
         const opt=f.options?.find(o=>o.v===val);
         if(opt){ if(opt.isCI) ciFlags.push({field:f.label,label:opt.ciLabel}); else ds+=opt.pts; }
       }
@@ -272,11 +206,12 @@ function computeScore(answers) {
 }
 
 function getTier(score){ return TIERS.find(t=>score>=t.min&&score<=t.max)??TIERS[0]; }
+const isIschial=(loc)=>loc==="ischial";
 
 function buildRecs(answers,tierId){
   const recs=[]; const mod=tierId==="moderate"; const hi=tierId==="high";
   const ni=tierId==="not_ideal"; const low=tierId==="low";
-  const loc=answers.location; const isch=loc==="ischial";
+  const loc=answers.location; const isch=isIschial(loc);
   const add=(r)=>recs.push(r);
 
   if(low){
@@ -290,41 +225,40 @@ function buildRecs(answers,tierId){
     if(hasNut) add({p:3,cat:"Nutritional Support",text:"Nutritional compromise is present. In the palliative context, the goal shifts from surgical optimization to sustaining meaningful oral intake and patient comfort. PEG or tube feeding is appropriate only if consistent with patient and family goals."});
     if(answers.pressureSurface===true) add({p:2,cat:"Pressure-Redistributing Surface",text:"No appropriate pressure-redistributing surface is in place. Placement of a low-air-loss or alternating-pressure mattress is a low-burden, high-impact comfort measure appropriate regardless of goals of care. Implement immediately."});
     if(answers.selfReposition==="d") add({p:3,cat:"Repositioning & Skin Integrity",text:"Patient is fully dependent for repositioning and cannot signal discomfort. A strict caregiver-driven repositioning schedule (every 2 hours) is essential for wound-related pain control and skin integrity, even in the palliative context."});
-    if(answers.soiling==="c") add({p:2,cat:"Wound Contamination Management",text:"Constant fecal soiling is contributing to wound odor, skin breakdown, and patient discomfort. A diverting colostomy or rectal tube may improve quality of life — the primary intent is comfort and dignity."});
+    if(answers.soiling==="c") add({p:2,cat:"Wound Contamination Management",text:"Constant fecal soiling is contributing to wound odor, skin breakdown, and patient discomfort. A diverting colostomy or rectal tube may improve quality of life significantly — the primary intent is comfort and dignity."});
     else if(answers.soiling==="b") add({p:3,cat:"Wound Contamination Management",text:"Intermittent soiling is present. Optimize bowel regimen and use barrier creams and high-absorbency protective dressings to minimize skin breakdown and discomfort."});
-    if(answers.osteomyelitis!=="a") add({p:3,cat:"Bone Involvement",text:"Osteomyelitis is present. In the palliative context, focus on pain control and odor management. Limited palliative-intent debridement may be appropriate if consistent with goals of care."});
-    add({p:4,cat:"Advanced Wound Care",text:"Long-term management with advanced dressings, moisture control, and scheduled limited debridements as tolerated. NPWT may be considered as an adjunct if consistent with patient goals — not mandatory."});
-    add({p:3,cat:"Social Work & Disposition",text:"Social work and case management focused on safe disposition, caregiver education, and quality-of-life optimization."});
+    if(answers.osteomyelitis!=="a") add({p:3,cat:"Bone Involvement",text:"Osteomyelitis is present. In the palliative context, focus on pain control and odor management. Limited palliative-intent debridement for symptom relief may be appropriate if consistent with goals of care."});
+    add({p:4,cat:"Advanced Wound Care",text:"Long-term management with advanced dressings, moisture control, and scheduled limited debridements as tolerated. NPWT may be considered as an adjunct if consistent with patient goals and tolerance — not mandatory."});
+    add({p:3,cat:"Social Work & Disposition",text:"Social work and case management focused on safe disposition, caregiver education and support, and quality-of-life optimization."});
     return recs.sort((a,b)=>a.p-b.p);
   }
-
-  if(answers.pressureSurface===true) add({p:1,cat:"Pressure-Redistributing Surface — Immediate Action Required",text:`No appropriate pressure-redistributing surface is in place — immediately correctable. Place a specialty low-air-loss or alternating-pressure mattress without delay. ${hi?"Document placement as a formal pre-operative action item. ":""}Confirm in place before scheduling surgery.`});
-  if(answers.selfReposition==="d") add({p:hi?1:2,cat:"Fully Dependent Repositioning — High Wound Recurrence Risk",text:`This patient cannot independently reposition or signal discomfort (quadriplegia, advanced dementia, severe stroke, severe contractures, or severe brain injury). ${hi?"A verified caregiver-executed 2-hour repositioning protocol must be documented before surgery is scheduled — mandatory pre-operative prerequisite.":"Establish a strict 2-hour caregiver-driven repositioning schedule immediately and educate caregivers on post-operative positioning restrictions."}`});
-  else if(answers.selfReposition==="c") add({p:3,cat:"Partial Repositioning Dependence",text:`Patient requires assistance for repositioning but can communicate discomfort. ${hi?"Confirm reliable caregiver availability for post-operative repositioning before scheduling.":"Establish assisted repositioning schedule and educate caregivers on positioning restrictions."}`});
-  if(answers.osteomyelitis==="c") add({p:1,cat:"Acute Osteomyelitis",text:"Acute osteomyelitis (≤ 4 weeks, purulent, no sequestrum) identified. MRI is indicated to define bony extent. Aggressive surgical debridement with intraoperative bone biopsy for culture-directed therapy is required before flap. Plan a 4–6 week course of organism-specific antibiotics. Bone margins must be viable and culture-negative at time of reconstruction."});
-  if(answers.soiling==="c") add({p:isch?1:2,cat:`Fecal / Urinary Diversion${isch?" — Critical at Ischial Site":""}`,text:mod?`Constant daily soiling poses a direct threat to flap integrity${isch?", particularly at the ischial site":""}. A temporary rectal tube should be placed immediately. Escalate to diverting sigmoid colostomy if contamination cannot be reliably controlled. Address urinary soiling with Foley or external collection device.`:`Constant daily fecal soiling is a primary modifiable risk factor${isch?" and carries especially high stakes at the ischial location":""}. A temporary diverting sigmoid colostomy is strongly recommended before definitive flap. Foley or suprapubic catheter required to eliminate urinary contamination during healing.`});
+  if(answers.pressureSurface===true) add({p:1,cat:"Pressure-Redistributing Surface — Immediate Action Required",text:`No appropriate pressure-redistributing surface is in place — immediately correctable and directly affects wound progression. Place a specialty low-air-loss or alternating-pressure mattress without delay. ${hi?"Document surface placement as a formal pre-operative action item. ":""}Confirm in place before scheduling surgery.`});
+  if(answers.selfReposition==="d") add({p:hi?1:2,cat:"Fully Dependent Repositioning — High Wound Recurrence Risk",text:`This patient cannot independently reposition or signal discomfort (quadriplegia, advanced dementia, severe stroke, severe contractures, or severe brain injury). ${hi?"A verified, caregiver-executed 2-hour repositioning protocol must be documented before surgery is scheduled — mandatory pre-operative prerequisite.":"Establish a strict 2-hour caregiver-driven repositioning schedule immediately and educate caregivers on post-operative positioning restrictions."}`});
+  else if(answers.selfReposition==="c") add({p:3,cat:"Partial Repositioning Dependence",text:`Patient requires assistance for repositioning but can communicate discomfort. ${hi?"Confirm reliable caregiver availability for post-operative repositioning before scheduling.":"Establish assisted repositioning schedule and educate caregivers on post-operative positioning restrictions."}`});
+  if(answers.osteomyelitis==="c") add({p:1,cat:"Acute Osteomyelitis",text:"Acute osteomyelitis (≤ 4 weeks, purulent, no sequestrum) is identified. MRI is indicated to define bony extent. Aggressive surgical debridement with intraoperative bone biopsy for culture-directed therapy is required before flap. Plan a 4–6 week course of organism-specific antibiotics. Bone margins must be viable and culture-negative at time of reconstruction."});
+  if(answers.soiling==="c") add({p:isch?1:2,cat:`Fecal / Urinary Diversion${isch?" — Critical at Ischial Site":""}`,text:mod?`Constant daily soiling poses a direct threat to flap integrity${isch?", particularly at the ischial site":""}. A temporary rectal tube should be placed immediately. Escalate to diverting sigmoid colostomy if contamination cannot be reliably controlled. Address urinary soiling with Foley catheter or external collection device.`:`Constant daily fecal soiling is a primary modifiable risk factor${isch?" and carries especially high stakes at the ischial location":""}. A temporary diverting sigmoid colostomy is strongly recommended before definitive flap. Foley or suprapubic catheter required to eliminate urinary contamination during healing.`});
   const pctEl=answers.pct==="b"; const inflam=answers.inflammation===true;
-  if(pctEl||inflam){ const markers=[pctEl&&"PCT 0.5–2.0 ng/mL",inflam&&"CRP > 100 mg/L or WBC ≥ 12,000/mm³"].filter(Boolean).join(", "); add({p:hi?1:2,cat:"Infection & Inflammation Control",text:mod?`Elevated inflammatory markers: ${markers}. Obtain wound cultures at next debridement. Initiate culture-directed antibiotic therapy. NPWT or NPWTi-d may be considered as an adjunct. Reassess markers at day 7–10 and confirm downtrend before finalizing flap timing.`:`Significant systemic inflammation: ${markers}. Must normalize before surgery proceeds. Formal Infectious Disease consultation required. Serial debridements every 48–72 hours. Flap timing guided by marker normalization.`});}
+  if(pctEl||inflam){ const markers=[pctEl&&"PCT 0.5–2.0 ng/mL",inflam&&"CRP > 100 mg/L or WBC ≥ 12,000/mm³"].filter(Boolean).join(", "); add({p:hi?1:2,cat:"Infection & Inflammation Control",text:mod?`Elevated inflammatory markers: ${markers}. Obtain wound cultures at next debridement. Initiate culture-directed antibiotic therapy. NPWT or NPWTi-d may be considered as an adjunct. Reassess markers at day 7–10 and confirm downtrend before finalizing flap timing.`:`Significant systemic inflammation: ${markers}. Must normalize before surgery proceeds. Formal Infectious Disease consultation required. Serial debridements every 48–72 hours — NPWTi-d may be considered as adjunct. Flap timing guided by marker normalization, not a fixed calendar date.`});}
   const alb=answers.albumin; const preal=answers.prealbumin; const bmi=answers.bmi;
-  const nutItems=[alb==="b"&&"albumin 3.0–3.49 g/dL",alb==="c"&&"albumin 2.5–2.99 g/dL",preal==="b"&&"prealbumin 12–17.9 mg/dL",preal==="c"&&"prealbumin < 12 mg/dL",bmi==="b"&&"borderline BMI or 10–20% weight loss",bmi==="c"&&"BMI < 18.5 or > 20% weight loss"].filter(Boolean);
+  const nutItems=[alb==="b"&&"albumin 3.0–3.49 g/dL (mild hypoalbuminemia)",alb==="c"&&"albumin 2.5–2.99 g/dL (moderate hypoalbuminemia)",preal==="b"&&"prealbumin 12–17.9 mg/dL (subclinical depletion)",preal==="c"&&"prealbumin < 12 mg/dL (severe depletion)",bmi==="b"&&"borderline BMI or 10–20% weight loss in 3 months",bmi==="c"&&"BMI < 18.5 or > 20% weight loss — severe malnutrition"].filter(Boolean);
   const sevMal=preal==="c"||bmi==="c";
-  if(nutItems.length>0){ const albNote="Albumin has an 18–20 day half-life — reflects chronic nutritional status and will not change meaningfully over a 1–2 week window. Do not use as a short-term response marker."; const prealNote=preal!=="a"?" Use prealbumin (half-life 2–3 days) to track response — target ≥ 18 mg/dL before proceeding.":""; add({p:sevMal?(hi?1:2):3,cat:"Nutritional Optimization",text:mod?`Nutritional deficits: ${nutItems.join("; ")}. Initiate high-protein diet (≥ 1.5 g/kg/day) with arginine/glutamine-enriched supplementation. ${sevMal?"NG tube indicated if oral targets not met within 48–72 hours. ":"Monitor and escalate to NG if targets not met. "}${albNote}${prealNote}`:`Malnutrition is a primary driver of high-risk status: ${nutItems.join("; ")}. Formal registered dietitian consultation required. ${sevMal?"PEG tube should be strongly considered. ":"Structured nutritional plan with defined re-assessment targets is mandatory. "}${albNote}${prealNote}`});}
-  if(answers.diabetes==="c") add({p:hi?1:2,cat:"Glycemic Control — HbA1c ≥ 8.0%",text:mod?"HbA1c ≥ 8.0% substantially increases infection and wound healing failure risk. Optimize regimen with primary care or endocrinology. Perioperative glucose target 140–180 mg/dL.":"HbA1c ≥ 8.0% must be formally addressed before scheduling. Endocrinology consultation required. Delay scheduling until glycemic control improves."});
+  if(nutItems.length>0){ const albNote="Albumin has an 18–20 day half-life — reflects chronic nutritional status and will not change meaningfully over a 1–2 week window. Do not use as a short-term response marker."; const prealNote=preal!=="a"?" Use prealbumin (half-life 2–3 days) to track response — target ≥ 18 mg/dL before proceeding.":""; add({p:sevMal?(hi?1:2):3,cat:"Nutritional Optimization",text:mod?`Nutritional deficits: ${nutItems.join("; ")}. Initiate high-protein diet (≥ 1.5 g/kg/day) with arginine/glutamine-enriched oral supplementation. ${sevMal?"Given severity, short-term NG tube indicated if oral intake targets not met within 48–72 hours. ":"Monitor and escalate to NG if targets not met. "}${albNote}${prealNote}`:`Malnutrition is a primary driver of high-risk status: ${nutItems.join("; ")}. Formal registered dietitian consultation required. ${sevMal?"PEG tube should be strongly considered — protein rehabilitation requires weeks, not days. ":"Structured nutritional plan with defined re-assessment targets is mandatory. "}${albNote}${prealNote}`});}
+  if(answers.diabetes==="c") add({p:hi?1:2,cat:"Glycemic Control — HbA1c ≥ 8.0%",text:mod?"HbA1c ≥ 8.0% substantially increases infection and wound healing failure risk. Optimize insulin or oral agent regimen with primary care or endocrinology. Perioperative glucose target 140–180 mg/dL.":"HbA1c ≥ 8.0% is a primary contributor to high-risk designation — must be formally addressed before scheduling. Endocrinology consultation required. Delay scheduling until glycemic control improves."});
   else if(answers.diabetes==="b") add({p:3,cat:"Glycemic Control — HbA1c 7.0–7.9%",text:"HbA1c 7.0–7.9% represents moderate glycemic control. Tighten regimen in coordination with managing physician. Establish perioperative glucose protocol targeting 140–180 mg/dL."});
-  if(answers.smoking==="b") add({p:hi?1:3,cat:`Smoking Cessation${hi?" — Mandatory":""}`,text:mod?"Active or recent smoking significantly increases risk of flap necrosis, dehiscence, and deep infection. Prescribe varenicline or nicotine replacement. Target ≥ 4 weeks confirmed abstinence. Confirm with urinary cotinine level.":"Nicotine abstinence ≥ 4 weeks is a mandatory prerequisite before surgery. Prescribe varenicline (preferred). Confirm with urinary cotinine — document as surgical prerequisite."});
-  if(answers.osteomyelitis==="b") add({p:2,cat:"Chronic Osteomyelitis",text:"Chronic osteomyelitis with sequestrum or sinus tract documented. Complete sequestrectomy and aggressive bony debridement required as staged procedure before flap. Plan 6-week culture-directed antibiotics. Confirm clean surgical margins."});
-  if(answers.priorFlap==="c") add({p:2,cat:"Multiple Prior Flap Failures at Site",text:"Two or more prior flap failures indicate local tissue options are likely exhausted. CT angiography or Doppler perforator mapping essential. Free flap from distant donor site should be primary strategy. Microsurgical team input required."});
-  else if(answers.priorFlap==="b") add({p:3,cat:"Prior Flap at Site",text:"One prior flap failure documented. Preoperative perforator mapping (Doppler ± CTA) recommended. Consider rotating to adjacent or previously unused donor site. Review operative notes to clarify failure mechanism."});
-  if(isch) add({p:3,cat:"Ischial Location — Highest Recurrence Site",text:`Ischial location carries the highest complication and recurrence rates. ${hi?"Fecal diversion must be secured before reconstruction. ":"Fecal diversion should be strongly considered before or at time of flap. "}Strict no-sitting protocol on operative side for minimum 4–6 weeks post-operatively is mandatory. Pre-operative patient and caregiver education on positioning adherence is critical.`});
-  if(loc==="multiple") add({p:3,cat:"Multiple Pressure Injury Sites",text:"Multiple sites present — ischial not involved. Prioritize highest-risk site for reconstruction first. Staged reconstruction generally preferable. Each site should be independently assessed. If any site is ischial, re-score using the Ischial location category."});
-  if(answers.woundSize==="c") add({p:3,cat:"Large Wound — > 100 cm²",text:"Wound area exceeds 100 cm². Flap design must ensure adequate volume and reach. CT angiography or Doppler perforator mapping recommended. Donor site morbidity planning particularly important."});
-  if(answers.irradiated===true) add({p:3,cat:"Irradiated Wound Bed",text:`Prior radiation significantly impairs local tissue healing. ${hi?"HBO therapy consultation should be obtained as part of the pre-operative plan. ":"Consider HBO therapy consultation. "}Flap design must include margins extending beyond irradiated tissue. Pedicle-based flaps originating outside radiation field preferred.`});
-  if(answers.steroids===true) add({p:3,cat:"Chronic Steroid Use",text:`Chronic steroid use impairs collagen synthesis and wound healing. Initiate Vitamin A supplementation (10,000–25,000 IU/day) per institutional protocol. ${hi?"Coordinate with prescribing physician on peri-operative taper. ":"Discuss peri-operative management with managing physician. "}Document Vitamin A start date in optimization plan.`});
-  if(answers.cardio==="c") add({p:hi?2:3,cat:"Cardiopulmonary / Renal Optimization",text:mod?"Multiple or symptomatic cardiopulmonary/renal conditions present. Formal specialist consultation required for clearance. Mandatory anesthesia pre-assessment before scheduling.":"Multiple or symptomatic conditions represent major perioperative risk. Cardiology and/or nephrology consultations required. Dedicated multi-specialty optimization plan must be documented."});
+  if(answers.smoking==="b") add({p:hi?1:3,cat:`Smoking Cessation${hi?" — Mandatory":""}`,text:mod?"Active or recent smoking significantly increases risk of flap necrosis, dehiscence, and deep infection. Prescribe varenicline or nicotine replacement immediately. Target ≥ 4 weeks confirmed abstinence before scheduling. Confirm with urinary cotinine level.":"Active or recent smoking is a non-negotiable optimization target. Nicotine abstinence ≥ 4 weeks is a mandatory prerequisite before surgery. Prescribe varenicline (preferred). Confirm abstinence with urinary cotinine — document as surgical prerequisite."});
+  if(answers.osteomyelitis==="b") add({p:2,cat:"Chronic Osteomyelitis",text:"Chronic osteomyelitis with sequestrum or sinus tract documented. Complete sequestrectomy and aggressive bony debridement required as staged procedure before flap. Plan 6-week culture-directed antibiotics. Confirm clean surgical margins — consider intraoperative bone biopsy."});
+  if(answers.priorFlap==="c") add({p:2,cat:"Multiple Prior Flap Failures at Site",text:"Two or more prior flap failures indicate local tissue options are likely exhausted. CT angiography or Doppler perforator mapping essential before further planning. Free flap from distant donor site should be primary strategy. Microsurgical team input required."});
+  else if(answers.priorFlap==="b") add({p:3,cat:"Prior Flap at Site",text:"One prior flap failure documented. Preoperative perforator mapping (Doppler ± CTA) recommended. Consider rotating to adjacent or previously unused donor site. Review operative notes from prior attempt to clarify failure mechanism."});
+  if(isch) add({p:3,cat:"Ischial Location — Highest Recurrence Site",text:`Ischial location carries the highest complication and recurrence rates among pressure injury sites. ${hi?"Fecal diversion must be secured before reconstruction. ":"Fecal diversion should be strongly considered before or at time of flap. "}Strict no-sitting protocol on operative side for minimum 4–6 weeks post-operatively is mandatory. Pre-operative patient and caregiver education on positioning adherence is critical.`});
+  if(loc==="multiple") add({p:3,cat:"Multiple Pressure Injury Sites",text:"Multiple sites present — ischial not involved. Prioritize highest-risk site for reconstruction first. Staged reconstruction generally preferable to simultaneous repair. Each site should be independently assessed for flap candidacy. If any site is ischial, re-score using the Ischial location category."});
+  if(answers.woundSize==="c") add({p:3,cat:"Large Wound — > 100 cm²",text:"Wound area exceeds 100 cm². Flap design must ensure adequate volume and reach. CT angiography or Doppler perforator mapping recommended to optimize design. Donor site morbidity planning particularly important at this size."});
+  if(answers.irradiated===true) add({p:3,cat:"Irradiated Wound Bed",text:`Prior radiation significantly impairs local tissue healing. ${hi?"Hyperbaric oxygen (HBO) therapy consultation should be obtained as part of the pre-operative plan. ":"Consider hyperbaric oxygen therapy consultation. "}Flap design must include margins extending beyond irradiated tissue boundary. Pedicle-based flaps originating outside radiation field preferred.`});
+  if(answers.steroids===true) add({p:3,cat:"Chronic Steroid Use",text:`Chronic steroid use impairs collagen synthesis, immune function, and wound healing. Initiate Vitamin A supplementation (10,000–25,000 IU/day) per institutional protocol. ${hi?"Coordinate with prescribing physician on peri-operative taper. ":"Discuss peri-operative management with managing physician. "}Document Vitamin A start date in optimization plan.`});
+  if(answers.cardio==="c") add({p:hi?2:3,cat:"Cardiopulmonary / Renal Optimization",text:mod?"Multiple or symptomatic cardiopulmonary/renal conditions present. Formal specialist consultation required for clearance. Mandatory anesthesia pre-assessment before scheduling.":"Multiple or symptomatic conditions represent major perioperative risk. Cardiology and/or nephrology consultations required before any surgical date. Dedicated multi-specialty optimization plan must be documented."});
   else if(answers.cardio==="b") add({p:4,cat:"Cardiopulmonary Clearance",text:"One stable major cardiopulmonary/renal condition documented. Obtain formal clearance from managing specialist. Communicate anticipated surgical demands to anesthesia team."});
-  if(answers.socialSupport==="b") add({p:hi?2:4,cat:"Social Work & Caregiver Planning",text:mod?"Inconsistent social support noted. Social work consultation recommended to strengthen home care plan. Confirm reliable caregiver availability for post-operative period.":"Inconsistent social support is a significant barrier. Social work and case management consultation mandatory before scheduling. Verified 24/7 caregiver plan is a formal pre-operative prerequisite."});
-  if(answers.soiling==="b") add({p:mod?4:3,cat:"Bowel Management",text:mod?"Intermittent soiling noted. Implement scheduled bowel management regimen. Escalate to rectal tube and reassess diversion if soiling cannot be reliably controlled.":"Intermittent soiling in high-risk patient warrants strong consideration of diverting ostomy. Foley or suprapubic catheter recommended to eliminate urinary contamination."});
-  if(hi) add({p:4,cat:"Re-Assessment Plan",text:"After completing optimization actions above, re-score this patient with the F2F tool. Target: score below 13 before scheduling flap. Document optimization start date and set defined re-assessment date."});
+  if(answers.socialSupport==="b") add({p:hi?2:4,cat:"Social Work & Caregiver Planning",text:mod?"Inconsistent social support noted. Social work consultation recommended to strengthen home care plan. Confirm reliable caregiver availability for immediate post-operative period.":"Inconsistent social support is a significant barrier to safe recovery. Social work and case management consultation mandatory before scheduling. Verified 24/7 caregiver plan is a formal pre-operative prerequisite."});
+  if(answers.soiling==="b") add({p:mod?4:3,cat:"Bowel Management",text:mod?"Intermittent soiling noted. Implement scheduled bowel management regimen. Escalate to rectal tube and reassess diversion if soiling frequency increases or cannot be reliably controlled.":"Intermittent soiling in high-risk patient warrants strong consideration of diverting ostomy. Foley or suprapubic catheter recommended to eliminate urinary contamination."});
+  if(hi) add({p:4,cat:"Re-Assessment Plan",text:"After completing optimization actions above, re-score this patient with the F2F tool. Target: score below 13 before scheduling flap reconstruction. Document optimization start date and set defined re-assessment date."});
   return recs.sort((a,b)=>a.p-b.p);
 }
 
@@ -335,7 +269,6 @@ const css = `
 @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Mono:wght@400;500&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--k:#111;--k2:#333;--k3:#666;--k4:#999;--g1:#f0f0f0;--g2:#e4e4e4;--g3:#ccc;--w:#fff;--r:#c8102e;--serif:'Instrument Serif',serif;--sans:'DM Sans',sans-serif;--mono:'DM Mono',monospace}
-html,body,#root{height:100%}
 body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smoothing:antialiased}
 .app{min-height:100vh;max-width:460px;margin:0 auto;display:flex;flex-direction:column}
 .hdr{background:var(--k);padding:14px 20px;position:sticky;top:0;z-index:50}
@@ -377,7 +310,7 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .al-title{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:4px}.al-body{font-size:12.5px;line-height:1.6;color:var(--k2)}
 .score-wrap{text-align:center;padding:32px 0 24px;border-bottom:1px solid var(--g2);margin-bottom:24px}
 .score-big{font-family:var(--serif);font-size:96px;line-height:1;letter-spacing:-.04em;color:var(--k);font-style:italic}
-.score-denom{font-family:var(--mono);font-size:13px;color:var(--k4);margin-top:2px}
+.score-denom{font-family:var(--mono);font-size:13px;color:var(--k4);margin-top:2px;letter-spacing:.05em}
 .tier-lbl{font-size:11px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--k);margin-top:18px}
 .tier-headline{font-size:13.5px;color:var(--k3);margin-top:6px;line-height:1.55;max-width:300px;margin-left:auto;margin-right:auto}
 .timing{font-family:var(--mono);font-size:11px;color:var(--k4);margin-top:8px;letter-spacing:.06em}
@@ -394,6 +327,7 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .rec-cat{font-size:12px;font-weight:700;color:var(--k);line-height:1.3;letter-spacing:.02em}.rec-cat.urg{color:var(--r)}
 .rec-body{font-size:13px;color:var(--k3);line-height:1.72;padding-left:28px}
 .tier-ref-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--g1)}.tier-ref-row:last-child{border-bottom:none}
+/* Home */
 .home-hero{padding:32px 0 28px;text-align:center}
 .home-title{font-family:var(--serif);font-size:38px;font-style:italic;letter-spacing:-.025em;color:var(--k);margin-bottom:6px}
 .home-sub{font-size:13px;color:var(--k4);line-height:1.6;max-width:280px;margin:0 auto}
@@ -402,11 +336,13 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .home-btn-sec{padding:13px 20px;background:var(--w);color:var(--k);border:1px solid var(--g2);font-family:var(--sans);font-size:14px;font-weight:500;cursor:pointer}
 .home-btn-sec:hover{background:var(--g1)}.home-links{display:flex;justify-content:center;gap:20px}
 .home-link{font-size:12px;color:var(--k4);background:none;border:none;cursor:pointer;font-family:var(--sans);text-decoration:underline;text-underline-offset:3px}
+/* Hospital */
 .hosp-card{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px 14px;border:1px solid var(--g2);background:var(--w);cursor:pointer;font-family:var(--sans);margin-bottom:6px;transition:all .1s}
 .hosp-card.selected{border-color:var(--k);background:var(--g1)}
 .hosp-radio{width:16px;height:16px;border:1.5px solid var(--g3);border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .1s}.hosp-radio.selected{border-color:var(--k)}
 .hosp-dot{width:8px;height:8px;background:var(--k);border-radius:50%}
 .hosp-name{font-size:13.5px;font-weight:500;color:var(--k)}.hosp-id{font-family:var(--mono);font-size:10px;color:var(--k4);margin-top:1px}
+/* ID confirm */
 .id-display{text-align:center;padding:32px 0 24px;border-bottom:1px solid var(--g2);margin-bottom:20px}
 .id-label{font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--k4);margin-bottom:8px}
 .id-number{font-family:var(--serif);font-size:64px;font-style:italic;letter-spacing:-.03em;color:var(--k);line-height:1}
@@ -415,27 +351,21 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .confirm-check-row.done{border-color:#16a34a;background:#f0fdf4}
 .confirm-chkbox{width:18px;height:18px;border:2px solid var(--r);flex-shrink:0;margin-top:1px;display:flex;align-items:center;justify-content:center;transition:all .12s}.confirm-chkbox.done{background:#16a34a;border-color:#16a34a}
 .confirm-chk-text{font-size:13px;line-height:1.5;color:var(--r);font-weight:500}.confirm-chk-text.done{color:#15803d}
+/* Copy button */
 .copy-btn{width:100%;padding:13px 20px;background:var(--w);color:var(--k);border:1.5px solid var(--k);font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:all .12s;margin-bottom:8px}
 .copy-btn:hover{background:var(--g1)}.copy-btn.copied{background:#f0fdf4;border-color:#16a34a;color:#15803d}
 .copy-fallback{width:100%;padding:10px;border:1px solid var(--g2);font-family:var(--mono);font-size:10px;color:var(--k3);background:var(--g1);resize:none;margin-bottom:8px}
+/* Records */
 .records-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
 .records-count{font-family:var(--mono);font-size:11px;color:var(--k4)}
 .export-btn{font-size:11px;font-weight:600;color:var(--k);background:var(--g1);border:1px solid var(--g2);padding:5px 12px;cursor:pointer;font-family:var(--sans)}
-.patient-group{margin-bottom:20px}
-.patient-group-header{display:flex;align-items:center;justify-content:space-between;padding-bottom:6px;border-bottom:1.5px solid var(--k);margin-bottom:6px}
-.patient-group-id{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--k)}
-.patient-group-hosp{font-size:11px;color:var(--k4)}
-.record-item{display:flex;align-items:center;justify-content:space-between;padding:9px 0 9px 12px;border-bottom:1px solid var(--g1);cursor:pointer;gap:12px}
-.record-item:hover .record-type{text-decoration:underline}
-.record-item:last-child{border-bottom:none}
-.record-type{font-size:12.5px;color:var(--k);font-weight:500}
-.record-date{font-size:11px;color:var(--k4);margin-top:1px}
-.record-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.record-score{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--k)}
-.type-icon{font-family:var(--mono);font-size:11px;color:var(--k4);width:14px}
+.record-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--g1);cursor:pointer;gap:12px}
+.record-left{display:flex;flex-direction:column;gap:3px}.record-id{font-family:var(--mono);font-size:13px;font-weight:500;color:var(--k)}.record-meta{font-size:11.5px;color:var(--k4)}
+.record-right{display:flex;align-items:center;gap:8px;flex-shrink:0}.record-score{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--k)}
 .tier-chip{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:3px 7px;border-radius:2px}
 .tier-chip.low{background:#dcfce7;color:#166534}.tier-chip.moderate{background:#fef9c3;color:#854d0e}.tier-chip.high{background:#ffedd5;color:#7c2d12}.tier-chip.not_ideal{background:#fee2e2;color:#991b1b}
 .empty-state{text-align:center;padding:48px 0;color:var(--k4)}.empty-icon{font-size:32px;margin-bottom:12px}.empty-text{font-size:14px;margin-bottom:4px;color:var(--k3)}.empty-sub{font-size:12px}
+/* Domain */
 .domain-tag{font-size:10px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:var(--k4);margin-bottom:5px}
 .domain-title{font-family:var(--serif);font-size:28px;letter-spacing:-.01em;color:var(--k);font-style:italic}
 .domain-meta{font-size:12px;color:var(--k4);margin-top:3px;margin-bottom:22px}
@@ -447,8 +377,22 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .settings-label{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--k4);margin-bottom:10px}
 .settings-input{width:100%;padding:11px 12px;border:1px solid var(--g2);font-family:var(--mono);font-size:12px;color:var(--k);background:var(--w);margin-bottom:8px;outline:none}
 .settings-input:focus{border-color:var(--k)}.settings-note{font-size:12px;color:var(--k4);line-height:1.6}
-.wh-status{font-size:11px;margin-top:6px;font-family:var(--mono)}
-.wh-ok{color:#16a34a}.wh-fail{color:var(--r)}.wh-none{color:var(--k4)}
+
+/* ── FONT SIZE SCALES ── */
+.fs-sm .opt-lbl,.fs-sm .ci-txt,.fs-sm .tog-lbl,.fs-sm .rec-body,.fs-sm .al-body,.fs-sm .settings-note{font-size:11px}
+.fs-sm .qlabel,.fs-sm .caption,.fs-sm .hosp-name,.fs-sm p{font-size:11px}
+.fs-sm .opt,.fs-sm .ci-row{padding:8px 10px}
+.fs-sm .qhint,.fs-sm .tog-hint,.fs-sm .records-count,.fs-sm .record-meta{font-size:10px}
+.fs-sm .btn-p,.fs-sm .btn-s,.fs-sm .home-btn-new,.fs-sm .home-btn-sec{font-size:12px}
+
+.fs-lg .opt-lbl,.fs-lg .ci-txt,.fs-lg .tog-lbl,.fs-lg .rec-body,.fs-lg .al-body,.fs-lg .settings-note{font-size:16px}
+.fs-lg .qlabel,.fs-lg .caption,.fs-lg .hosp-name,.fs-lg p{font-size:16px}
+.fs-lg .opt,.fs-lg .ci-row{padding:14px 14px}
+.fs-lg .qhint,.fs-lg .tog-hint{font-size:14px}
+.fs-lg .btn-p,.fs-lg .btn-s,.fs-lg .home-btn-new,.fs-lg .home-btn-sec{font-size:16px;padding:16px 20px}
+.fs-lg .opt-pts{font-size:13px}
+.fs-lg .tbtn{font-size:14px;padding:8px 16px}
+.fs-lg .confirm-chk-text{font-size:16px}
 `;
 
 /* ═══════════════════════════════════════════════
@@ -471,6 +415,7 @@ function RadioField({field,value,onChange}){
     </div>
   );
 }
+
 function ToggleField({field,value,onChange}){
   return(
     <div className="tog">
@@ -486,6 +431,7 @@ function ToggleField({field,value,onChange}){
     </div>
   );
 }
+
 function RecCard({rec,index}){
   const urgent=rec.p===1;
   return(
@@ -499,6 +445,7 @@ function RecCard({rec,index}){
     </div>
   );
 }
+
 function TierChip({tierId}){
   const labels={low:"Low",moderate:"Moderate",high:"High",not_ideal:"Not Ideal"};
   return <span className={`tier-chip ${tierId}`}>{labels[tierId]||tierId}</span>;
@@ -508,138 +455,158 @@ function TierChip({tierId}){
    MAIN APP
 ═══════════════════════════════════════════════ */
 const TOTAL_WIZ=6;
-const TYPE_LABELS={new:"New Patient",reassessment:"Re-Assessment",preop:"Pre-Operative"};
-const TYPE_ICONS={new:"✦",reassessment:"↺",preop:"✓"};
 
 export default function F2FApp(){
-  const [screen,       setScreen]       = useState("home");
-  const [wizStep,      setWizStep]      = useState(1);
-  const [ciChecked,    setCiChecked]    = useState({});
-  const [answers,      setAnswers]      = useState({});
-  const [hospital,     setHospital]     = useState(null);
-  const [studyId,      setStudyId]      = useState(null);
-  const [enrollDate,   setEnrollDate]   = useState(null);
-  const [deIdDone,     setDeIdDone]     = useState(false);
-  const [selectedHosp, setSelectedHosp]= useState(null);
-  const [assessType,   setAssessType]   = useState(null);
-  const [existingId,   setExistingId]   = useState("");
-  const [cases,        setCases]        = useState([]);
-  const [selCase,      setSelCase]      = useState(null);
-  const [copied,       setCopied]       = useState(false);
-  const [copyFallback, setCopyFallback] = useState(false);
-  const [copyText,     setCopyText]     = useState("");
-  const [webhookUrl,   setWebhookUrl]   = useState("");
-  const [webhookInput, setWebhookInput] = useState("");
-  const [webhookStatus,setWebhookStatus]= useState(null);
-  const [savingWh,     setSavingWh]     = useState(false);
+  // Session-only counters (reset on reload — use Vercel version for persistence)
+  const counters = useRef({LCH:0,PGH:0,DMC:0,NLN:0,OTH:0});
 
-  // Load persisted data on mount
-  useEffect(()=>{
-    const url = lsGet("f2f_setting_webhook")||"";
-    setWebhookUrl(url); setWebhookInput(url);
-    setCases(fetchAllCases());
-  },[]);
+  const [screen,        setScreen]        = useState("home");
+  const [wizStep,       setWizStep]       = useState(1);
+  const [ciChecked,     setCiChecked]     = useState({});
+  const [answers,       setAnswers]       = useState({});
+  const [hospital,      setHospital]      = useState(null);
+  const [studyId,       setStudyId]       = useState(null);
+  const [enrollDate,    setEnrollDate]    = useState(null);
+  const [deIdDone,      setDeIdDone]      = useState(false);
+  const [selectedHosp,  setSelectedHosp]  = useState(null);
+  const [assessType,    setAssessType]    = useState(null);
+  const [existingId,    setExistingId]    = useState("");
+  const [manualId,      setManualId]      = useState("");
+  const [sessionCases,  setSessionCases]  = useState([]);
+  const [selCase,       setSelCase]       = useState(null);
+  const [copied,        setCopied]        = useState(false);
+  const [copyFallback,  setCopyFallback]  = useState(false);
+  const [copyText,      setCopyText]      = useState("");
+  const [fieldStep,     setFieldStep]     = useState(0);
+  const [fontSize,      setFontSize]      = useState(()=>{ try{return localStorage.getItem("f2f_fontsize")||"md";}catch(e){return "md";} });
+
+  // ── Per-domain page layout: each radio = own page, all toggles grouped at end
+  function getDomainPages(d){
+    const radios = d.fields.filter(f=>f.type==="radio");
+    const toggles = d.fields.filter(f=>f.type==="toggle");
+    const pages = radios.map(f=>({type:"single",field:f}));
+    if(toggles.length>0) pages.push({type:"toggles",fields:toggles});
+    return pages;
+  }
 
   const hasRedFlag = Object.values(ciChecked).some(Boolean);
-  const domain     = DOMAINS[wizStep-2]??null;
+  const domain     = wizStep>=2&&wizStep<=5 ? DOMAINS[wizStep-2] : null;
+  const domainPages= domain ? getDomainPages(domain) : [];
+  const currentPage= domainPages[fieldStep]??null;
+
   const updateAnswer=(id,val)=>setAnswers(p=>({...p,[id]:val}));
   const toggleFlag=(id)=>setCiChecked(p=>({...p,[id]:!p[id]}));
+  const cycleFontSize=()=>setFontSize(s=>{
+    const next={sm:"md",md:"lg",lg:"sm"}[s]||"md";
+    try{localStorage.setItem("f2f_fontsize",next);}catch(e){}
+    return next;
+  });
 
-  const isDomainComplete=useMemo(()=>{
-    if(!domain) return true;
-    return domain.fields.filter(f=>f.type==="radio").every(f=>answers[f.id]!==undefined);
-  },[domain,answers]);
+  const isCurrentPageComplete=useMemo(()=>{
+    if(!currentPage) return true;
+    if(currentPage.type==="single") return answers[currentPage.field.id]!==undefined;
+    return true; // toggles always complete (default No)
+  },[currentPage,answers]);
 
   const {total,ciFlags,domainScores}=useMemo(()=>computeScore(answers),[answers]);
   const tier=getTier(total);
   const recs=useMemo(()=>buildRecs(answers,tier.id),[answers,tier.id]);
-  const pct=wizStep===1?0:Math.round((wizStep/TOTAL_WIZ)*100);
-  const assessLabel=TYPE_LABELS[assessType]||"New Patient";
+
+  // Progress: 5% for flags, 90% spread across all domain pages, 5% buffer
+  const totalDomainPages = DOMAINS.reduce((sum,d)=>sum+getDomainPages(d).length,0);
+  const completedDomainPages = DOMAINS.slice(0,wizStep-2).reduce((sum,d)=>sum+getDomainPages(d).length,0) + (wizStep>=2&&wizStep<=5?fieldStep:0);
+  const pct = wizStep===1?5 : wizStep===6?100 : Math.round(5+(completedDomainPages/totalDomainPages)*90);
 
   /* ── HANDLERS ── */
-  async function handleGenerateId(){
-    if(!selectedHosp) return;
-    const id=generateStudyId(selectedHosp.id);
+  function handleConfirmId(){
+    if(!selectedHosp||manualId.trim().length<4) return;
+    const id=manualId.trim().toUpperCase();
     const now=new Date().toISOString().split("T")[0];
-    setStudyId(id); setHospital(selectedHosp); setEnrollDate(now); setDeIdDone(false);
-    // Auto-call webhook if configured
-    if(webhookUrl){
-      setWebhookStatus("sending");
-      const status=await callWebhook(webhookUrl,id,selectedHosp.name,now);
-      setWebhookStatus(status);
-    }
-    setScreen("id_confirm");
+    setStudyId(id); setHospital(selectedHosp); setEnrollDate(now);
+    setDeIdDone(false); setScreen("id_confirm");
   }
 
   function handleBeginAssessment(){
     if(!deIdDone) return;
-    setWizStep(1); setCiChecked({}); setAnswers({});
+    setWizStep(1); setFieldStep(0); setCiChecked({}); setAnswers({});
     setCopied(false); setCopyFallback(false); setScreen("wizard");
   }
 
   function goNextWiz(){
     if(wizStep===1&&hasRedFlag) return;
-    if(wizStep>=2&&wizStep<=5&&!isDomainComplete) return;
-    if(wizStep===5){
-      setWizStep(6);
-      const caseData={
-        studyId, hospital:hospital.name, hospitalId:hospital.id, enrollmentDate:enrollDate,
-        assessmentType:assessType||"new",
-        savedAt:new Date().toISOString(), answers:{...answers}, score:total,
-        tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
-      };
-      persistCase(caseData);
-      setCases(fetchAllCases());
-    } else {
-      setWizStep(s=>Math.min(s+1,TOTAL_WIZ));
+    if(wizStep>=2&&wizStep<=5){
+      if(!isCurrentPageComplete) return;
+      if(fieldStep<domainPages.length-1){ setFieldStep(f=>f+1); return; }
+      // last page of domain
+      if(wizStep===5){
+        setWizStep(6); setFieldStep(0);
+        const caseData={
+          studyId, hospital:hospital.name, hospitalId:hospital.id, enrollmentDate:enrollDate,
+          assessmentType:assessType||"new",
+          savedAt:new Date().toISOString(), answers:{...answers}, score:total,
+          tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
+        };
+        setSessionCases(prev=>[...prev.filter(c=>c.studyId!==studyId),caseData]);
+      } else {
+        setWizStep(s=>s+1); setFieldStep(0);
+      }
+      return;
     }
+    if(wizStep===1){ setWizStep(2); setFieldStep(0); }
   }
 
   function goPrevWiz(){
-    if(wizStep===1){setScreen("home");return;}
-    setWizStep(s=>Math.max(s-1,1));
+    if(wizStep===1){ setScreen("home"); return; }
+    if(wizStep>=2&&wizStep<=5){
+      if(fieldStep>0){ setFieldStep(f=>f-1); return; }
+      if(wizStep===2){ setWizStep(1); setFieldStep(0); }
+      else {
+        const prevDomain=DOMAINS[wizStep-3];
+        const prevPages=getDomainPages(prevDomain);
+        setWizStep(s=>s-1); setFieldStep(prevPages.length-1);
+      }
+      return;
+    }
+    if(wizStep===6){
+      const lastDomain=DOMAINS[3];
+      const lastPages=getDomainPages(lastDomain);
+      setWizStep(5); setFieldStep(lastPages.length-1);
+    }
   }
 
   function handleCopy(){
-    const text=buildCopyText(studyId,hospital.name,enrollDate,answers,total,tier,domainScores,assessLabel);
+    const aLabel={new:"New Patient",reassessment:"Re-Assessment",preop:"Pre-Operative"}[assessType]||"New Patient";
+    const text=buildCopyText(studyId,hospital.name,enrollDate,answers,total,tier,domainScores,aLabel);
     setCopyText(text);
     if(navigator.clipboard?.writeText){
       navigator.clipboard.writeText(text)
         .then(()=>{setCopied(true);setTimeout(()=>setCopied(false),3000);})
         .catch(()=>setCopyFallback(true));
-    } else { setCopyFallback(true); }
+    } else {
+      setCopyFallback(true);
+    }
   }
 
-  function exportCSV(){
-    const allCases=fetchAllCases();
-    if(allCases.length===0) return;
-    const csv=buildCSV(allCases);
+  function exportSessionCSV(){
+    if(sessionCases.length===0) return;
+    const csv=buildSessionCSV(sessionCases);
     const a=document.createElement("a");
     a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-    a.download=`F2F_Data_${new Date().toISOString().split("T")[0]}.csv`;
+    a.download=`F2F_Session_${enrollDate||"data"}.csv`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
   }
 
-  async function saveWebhook(){
-    setSavingWh(true);
-    lsSet("f2f_setting_webhook",webhookInput);
-    setWebhookUrl(webhookInput);
-    setSavingWh(false);
-  }
-
   function resetAll(){
-    setScreen("home"); setWizStep(1); setCiChecked({}); setAnswers({});
+    setScreen("home"); setWizStep(1); setFieldStep(0); setCiChecked({}); setAnswers({});
     setHospital(null); setStudyId(null); setEnrollDate(null); setDeIdDone(false);
-    setSelectedHosp(null); setAssessType(null); setExistingId("");
-    setCopied(false); setCopyFallback(false); setSelCase(null); setWebhookStatus(null);
+    setSelectedHosp(null); setAssessType(null); setExistingId(""); setManualId("");
+    setCopied(false); setCopyFallback(false); setSelCase(null);
   }
-
-  const grouped = useMemo(()=>groupCasesByStudyId(cases),[cases]);
-  const showProg=screen==="wizard"&&wizStep<6;
 
   /* ══════════════════════════════════════════
      SCREENS
   ══════════════════════════════════════════ */
+
   const renderHome=()=>(
     <div>
       <div className="home-hero">
@@ -647,32 +614,37 @@ export default function F2FApp(){
         <div className="home-sub">Pre-operative risk stratification · Pressure Injury Module v1.1</div>
       </div>
       <div className="home-btns">
-        <button className="home-btn-new" onClick={()=>setScreen("intake")}>New Assessment</button>
-        <button className="home-btn-sec" onClick={()=>{setCases(fetchAllCases());setScreen("records");}}>
-          Patient Records {cases.length>0&&`(${cases.length})`}
+        <button className="home-btn-new" onClick={()=>setScreen("intake")}>New Patient Assessment</button>
+        <button className="home-btn-sec" onClick={()=>setScreen("records")}>
+          Session Records {sessionCases.length>0&&`(${sessionCases.length})`}
         </button>
       </div>
-      <div className="alert al-dark">
+      <div className="alert al-amber">
+        <div className="al-title" style={{color:"#92400e"}}>Session Storage — Data Clears on Reload</div>
+        <div className="al-body" style={{color:"#78350f"}}>This app runs in session memory only. Always use <strong>Copy Results</strong> after each patient to capture data before closing. For persistent storage, use the Vercel-deployed version.</div>
+      </div>
+      <div className="alert al-dark" style={{marginBottom:20}}>
         <div className="al-title" style={{color:"var(--k)"}}>Clinical Disclaimer</div>
         <div className="al-body">For research and educational purposes only. Not a substitute for clinical judgment.</div>
       </div>
-      <div style={{marginTop:16}} className="home-links">
+      <div className="home-links">
         <button className="home-link" onClick={()=>setScreen("settings")}>⚙ Settings</button>
         <button className="home-link" onClick={()=>setScreen("about")}>About F2F</button>
       </div>
     </div>
   );
 
-  const ASSESS_TYPES=[
-    {id:"new",          label:"New Patient",        sub:"First assessment — generates a new Study ID",           icon:"✦"},
-    {id:"reassessment", label:"Re-Assessment",       sub:"Patient previously scored — optimization complete",     icon:"↺"},
-    {id:"preop",        label:"Pre-Operative Score", sub:"Final score before scheduling surgery",                 icon:"✓"},
+  const ASSESS_TYPES = [
+    { id:"new",          label:"New Patient",          sub:"First assessment — generates a new Study ID",            icon:"✦" },
+    { id:"reassessment", label:"Re-Assessment",         sub:"Patient was previously scored — optimization complete",  icon:"↺" },
+    { id:"preop",        label:"Pre-Operative Score",   sub:"Final score before scheduling surgery",                  icon:"✓" },
   ];
 
   const renderIntake=()=>(
     <div>
       <button className="back-link" onClick={()=>{setScreen("home");setAssessType(null);setSelectedHosp(null);setExistingId("");}}>← Back</button>
 
+      {/* Step 1: Assessment type */}
       {!assessType&&(
         <>
           <div className="eyebrow">New Assessment</div>
@@ -693,44 +665,60 @@ export default function F2FApp(){
         </>
       )}
 
-      {assessType==="new"&&(
+      {/* New Patient: hospital select + manual Study ID */}
+      {assessType==="new"&&!studyId&&(
         <>
           <div className="eyebrow">New Patient</div>
           <div className="display" style={{marginBottom:4}}>Select Hospital</div>
-          <div className="caption" style={{marginBottom:20}}>Select the hospital where this patient is being evaluated.</div>
+          <div className="caption" style={{marginBottom:20}}>Select the hospital, then enter the Study ID from your de-identification log.</div>
           {HOSPITALS.map(h=>(
             <button key={h.id} className={`hosp-card ${selectedHosp?.id===h.id?"selected":""}`}
-              onClick={()=>setSelectedHosp(h)}>
+              onClick={()=>{ setSelectedHosp(h); setManualId(`${h.id}-`); }}>
               <div className={`hosp-radio ${selectedHosp?.id===h.id?"selected":""}`}>
                 {selectedHosp?.id===h.id&&<div className="hosp-dot"/>}
               </div>
-              <div><div className="hosp-name">{h.name}</div><div className="hosp-id">{h.id}</div></div>
+              <div>
+                <div className="hosp-name">{h.name}</div>
+                <div className="hosp-id">{h.id}</div>
+              </div>
             </button>
           ))}
-          {webhookUrl&&(
-            <div style={{fontSize:11,color:"#16a34a",fontFamily:"var(--mono)",margin:"8px 0"}}>
-              ✓ Study ID will be auto-logged to OneDrive via Make.com
+          {selectedHosp&&(
+            <div style={{marginTop:16,marginBottom:8}}>
+              <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"var(--k4)",marginBottom:6}}>Study ID</div>
+              <input
+                style={{width:"100%",padding:"12px 14px",border:"1.5px solid var(--k)",fontFamily:"var(--mono)",fontSize:22,fontWeight:700,color:"var(--k)",background:"var(--w)",letterSpacing:".08em",textTransform:"uppercase",outline:"none",marginBottom:4}}
+                placeholder={`${selectedHosp.id}-001`}
+                value={manualId}
+                onChange={e=>setManualId(e.target.value.toUpperCase())}
+              />
+              <div style={{fontSize:11,color:"var(--k4)"}}>Enter the next Study ID from your de-identification log. Format: {selectedHosp.id}-001, {selectedHosp.id}-002, etc.</div>
             </div>
           )}
-          <div style={{display:"flex",gap:8,marginTop:8}}>
+          <div style={{marginTop:8,display:"flex",gap:8}}>
             <button className="btn-s" onClick={()=>setAssessType(null)}>← Back</button>
-            <button className="btn-p" style={{flex:2}} disabled={!selectedHosp} onClick={handleGenerateId}>
-              Generate Study ID →
+            <button className="btn-p" style={{flex:2}}
+              disabled={!selectedHosp||manualId.trim().length<4}
+              onClick={handleConfirmId}>
+              Confirm & Continue →
             </button>
           </div>
         </>
       )}
 
+      {/* Re-assessment / Pre-op: enter existing Study ID */}
       {(assessType==="reassessment"||assessType==="preop")&&(
         <>
           <div className="eyebrow">{assessType==="preop"?"Pre-Operative Score":"Re-Assessment"}</div>
           <div className="display" style={{marginBottom:4}}>Enter Study ID</div>
-          <div className="caption" style={{marginBottom:20}}>Enter the existing Study ID from your de-identification log.</div>
+          <div className="caption" style={{marginBottom:20}}>
+            Enter the existing Study ID for this patient from your de-identification log.
+          </div>
           <div className="alert al-dark" style={{marginBottom:16}}>
             <div className="al-body">
               {assessType==="reassessment"
                 ?"This will be saved as a re-assessment linked to the original Study ID. No new de-identification log entry is needed."
-                :"This is the final score before surgical scheduling — saved under the original Study ID as the pre-operative assessment."}
+                :"This is the final score before surgical scheduling. It will be saved under the original Study ID as the pre-operative assessment."}
             </div>
           </div>
           <input
@@ -744,14 +732,19 @@ export default function F2FApp(){
             <button className="btn-p" style={{flex:2}}
               disabled={existingId.trim().length<4}
               onClick={()=>{
+                const now=new Date().toISOString().split("T")[0];
+                // Infer hospital from study ID prefix
                 const prefix=existingId.trim().split("-")[0];
                 const hosp=HOSPITALS.find(h=>h.id===prefix)||{id:prefix,name:prefix,short:prefix};
-                setStudyId(existingId.trim()); setHospital(hosp);
-                setEnrollDate(new Date().toISOString().split("T")[0]);
-                setDeIdDone(true); setWizStep(1); setCiChecked({}); setAnswers({});
-                setCopied(false); setCopyFallback(false); setScreen("wizard");
+                setStudyId(existingId.trim());
+                setHospital(hosp);
+                setEnrollDate(now);
+                setDeIdDone(true); // no de-ID step needed
+                setWizStep(1); setCiChecked({}); setAnswers({});
+                setCopied(false); setCopyFallback(false);
+                setScreen("wizard");
               }}>
-              Begin {assessType==="preop"?"Pre-Op Score":"Re-Assessment"} →
+              Begin {assessType==="preop"?"Pre-Op":"Re-Assessment"} →
             </button>
           </div>
         </>
@@ -762,19 +755,14 @@ export default function F2FApp(){
   const renderIdConfirm=()=>(
     <div>
       <div className="id-display">
-        <div className="id-label">New Study ID — {hospital?.name}</div>
+        <div className="id-label">Study ID — {hospital?.name}</div>
         <div className="id-number">{studyId}</div>
         <div className="id-date">{enrollDate}</div>
       </div>
 
-      {webhookStatus==="sending"&&<div className="alert al-neutral"><div className="al-body">Logging to OneDrive via Make.com…</div></div>}
-      {webhookStatus==="success"&&<div className="alert al-green"><div className="al-body">✓ Study ID logged to OneDrive de-identification file automatically.</div></div>}
-      {webhookStatus==="failed"&&<div className="alert al-red"><div className="al-body" style={{color:"var(--r)"}}>⚠ OneDrive log failed. Record this Study ID manually in your de-identification log.</div></div>}
-      {webhookStatus==="no_url"&&null}
-
       <div className="alert al-dark" style={{marginBottom:16}}>
         <div className="al-title" style={{color:"var(--k)"}}>De-Identification Log — Required Action</div>
-        <div className="al-body">Record <strong>{studyId}</strong> in your de-identification log alongside the patient's MRN. The app stores no PHI.</div>
+        <div className="al-body">Before proceeding, record <strong>{studyId}</strong> in your de-identification log alongside the patient's MRN. The app does not store any PHI.</div>
       </div>
 
       <button className={`confirm-check-row ${deIdDone?"done":""}`} onClick={()=>setDeIdDone(d=>!d)}>
@@ -782,15 +770,22 @@ export default function F2FApp(){
           {deIdDone&&<span style={{color:"var(--w)",fontSize:10,fontWeight:900}}>✓</span>}
         </div>
         <span className={`confirm-chk-text ${deIdDone?"done":""}`}>
-          {deIdDone?`Confirmed — ${studyId} has been recorded in the de-identification log`:`I have recorded ${studyId} in my de-identification log alongside the patient's MRN`}
+          {deIdDone
+            ?`Confirmed — ${studyId} has been recorded in the de-identification log`
+            :`I have recorded ${studyId} in my de-identification log alongside the patient's MRN`}
         </span>
       </button>
 
       <button className="btn-p" disabled={!deIdDone} onClick={handleBeginAssessment}>
         Begin F2F Assessment →
       </button>
+      <div style={{textAlign:"center",marginTop:10}}>
+        <button className="home-link" onClick={()=>setScreen("intake")}>← Change hospital</button>
+      </div>
     </div>
   );
+
+  const assessLabel = {new:"New Patient", reassessment:"Re-Assessment", preop:"Pre-Operative"}[assessType]||"";
 
   const renderWizard=()=>(
     <div>
@@ -832,29 +827,38 @@ export default function F2FApp(){
         </div>
       )}
 
-      {wizStep>=2&&wizStep<=5&&domain&&(
+      {wizStep>=2&&wizStep<=5&&domain&&currentPage&&(
         <div>
-          <div className="domain-tag">Domain {wizStep-1} of 4</div>
-          <div className="domain-title">{domain.label}</div>
-          <div className="domain-meta">Max {domain.maxPts} pts · Complete all fields to continue</div>
-          {domain.fields.map(f=>f.type==="radio"
-            ?<RadioField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
-            :<ToggleField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
+          <div className="domain-tag">Domain {wizStep-1} of 4 · {domain.label}</div>
+          <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:20}}>
+            Question {fieldStep+1} of {domainPages.length}
+          </div>
+
+          {currentPage.type==="single"&&(
+            <RadioField field={currentPage.field} value={answers[currentPage.field.id]} onChange={updateAnswer}/>
           )}
-          {isDomainComplete&&(
-            <div className="domain-preview">
-              <span className="dp-label">Domain score</span>
-              <span className="dp-score">{domainScores[domain.id]??0} / {domain.maxPts} pts</span>
+
+          {currentPage.type==="toggles"&&(
+            <div>
+              <div className="domain-title" style={{marginBottom:16}}>{domain.label}</div>
+              {currentPage.fields.map(f=>(
+                <ToggleField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
+              ))}
+              <div style={{marginTop:12,padding:"10px 12px",background:"var(--g1)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:11.5,color:"var(--k4)"}}>Domain score so far</span>
+                <span style={{fontFamily:"var(--mono)",fontSize:14,color:"var(--k)",fontWeight:500}}>{domainScores[domain.id]??0} / {domain.maxPts} pts</span>
+              </div>
             </div>
           )}
-          <div className="btn-row">
+
+          <div className="btn-row" style={{marginTop:24}}>
             <button className="btn-s" onClick={goPrevWiz}>← Back</button>
-            <button className="btn-p" style={{flex:2,background:isDomainComplete?"var(--k)":"#94a3b8"}}
-              disabled={!isDomainComplete} onClick={goNextWiz}>
-              {wizStep===5?"Calculate Score →":"Next →"}
+            <button className="btn-p" style={{flex:2,background:isCurrentPageComplete?"var(--k)":"#94a3b8"}}
+              disabled={!isCurrentPageComplete} onClick={goNextWiz}>
+              {wizStep===5&&fieldStep===domainPages.length-1?"Calculate Score →":"Next →"}
             </button>
           </div>
-          {!isDomainComplete&&<div style={{textAlign:"center",fontSize:12,color:"#94a3b8",marginTop:8}}>Complete all selections to continue</div>}
+          {!isCurrentPageComplete&&<div style={{textAlign:"center",fontSize:12,color:"#94a3b8",marginTop:8}}>Make a selection to continue</div>}
         </div>
       )}
 
@@ -862,7 +866,12 @@ export default function F2FApp(){
         <div>
           <div style={{textAlign:"center",marginBottom:6}}>
             <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.1em",color:"#94a3b8"}}>F2F Score Result</div>
-            <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--k4)",marginTop:2}}>{studyId} · {hospital?.short} · {assessLabel}</div>
+            <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--k4)",marginTop:2}}>{studyId} · {hospital?.short} · {assessLabel||"New Patient"}</div>
+            <div style={{fontSize:10,color:"var(--k4)",marginTop:3,letterSpacing:".08em",textTransform:"uppercase"}}>
+              {assessType==="reassessment"&&"Re-Assessment"}
+              {assessType==="preop"&&"Pre-Operative Score"}
+              {assessType==="new"&&"Initial Assessment"}
+            </div>
           </div>
 
           <div className="score-wrap">
@@ -873,13 +882,15 @@ export default function F2FApp(){
             {tier.timing&&<div className="timing">Optimization window · {tier.timing}</div>}
           </div>
 
+          {/* COPY RESULTS — primary action on mobile */}
           <div style={{marginBottom:20}}>
             <button className={`copy-btn ${copied?"copied":""}`} onClick={handleCopy}>
               {copied?"✓ Copied to clipboard":"📋 Copy Results to Clipboard"}
             </button>
+            {!copied&&<div style={{textAlign:"center",fontSize:11,color:"var(--r)",marginBottom:8,fontWeight:600}}>⚠ Copy before closing — data clears on reload</div>}
             {copyFallback&&(
               <div>
-                <div style={{fontSize:11,color:"var(--k4)",marginBottom:4}}>Select all and copy manually:</div>
+                <div style={{fontSize:11,color:"var(--k4)",marginBottom:4}}>Clipboard unavailable — select all and copy manually:</div>
                 <textarea className="copy-fallback" rows={6} readOnly value={copyText} onClick={e=>e.target.select()}/>
               </div>
             )}
@@ -943,41 +954,31 @@ export default function F2FApp(){
       <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
       <div className="records-header">
         <div>
-          <div className="display" style={{fontSize:24,marginBottom:2}}>Patient Records</div>
-          <div className="records-count">{cases.length} record{cases.length!==1?"s":""} · persistent · no PHI</div>
+          <div className="display" style={{fontSize:24,marginBottom:2}}>Session Records</div>
+          <div className="records-count">{sessionCases.length} case{sessionCases.length!==1?"s":""} · clears on reload</div>
         </div>
-        {cases.length>0&&<button className="export-btn" onClick={exportCSV}>Export CSV</button>}
+        {sessionCases.length>0&&<button className="export-btn" onClick={exportSessionCSV}>Export CSV</button>}
       </div>
-
-      {cases.length===0&&(
+      <div className="alert al-amber" style={{marginBottom:16}}>
+        <div className="al-body" style={{color:"#78350f"}}>Session data only. Export CSV or Copy Results before closing the app. For persistent storage, deploy the Vercel version.</div>
+      </div>
+      {sessionCases.length===0&&(
         <div className="empty-state">
           <div className="empty-icon">📋</div>
-          <div className="empty-text">No records yet</div>
+          <div className="empty-text">No cases in this session</div>
           <div className="empty-sub">Complete a patient assessment to see it here</div>
         </div>
       )}
-
-      {grouped.map(([sid, sCases])=>(
-        <div key={sid} className="patient-group">
-          <div className="patient-group-header">
-            <span className="patient-group-id">{sid}</span>
-            <span className="patient-group-hosp">{sCases[0]?.hospital}</span>
+      {sessionCases.map(c=>(
+        <div key={c.studyId} className="record-item" onClick={()=>{setSelCase(c);setScreen("detail");}}>
+          <div className="record-left">
+            <div className="record-id">{c.studyId}</div>
+            <div className="record-meta">{c.hospital} · {c.enrollmentDate}</div>
           </div>
-          {sCases.map((c,i)=>(
-            <div key={i} className="record-item" onClick={()=>{setSelCase(c);setScreen("detail");}}>
-              <div style={{display:"flex",alignItems:"center",gap:8,flex:1}}>
-                <span className="type-icon">{TYPE_ICONS[c.assessmentType]||"✦"}</span>
-                <div>
-                  <div className="record-type">{TYPE_LABELS[c.assessmentType]||"New Patient"}</div>
-                  <div className="record-date">{c.enrollmentDate}</div>
-                </div>
-              </div>
-              <div className="record-right">
-                <span className="record-score">{c.score}</span>
-                <TierChip tierId={c.tierId}/>
-              </div>
-            </div>
-          ))}
+          <div className="record-right">
+            <span className="record-score">{c.score}</span>
+            <TierChip tierId={c.tierId}/>
+          </div>
         </div>
       ))}
     </div>
@@ -988,14 +989,12 @@ export default function F2FApp(){
     const t=TIERS.find(t=>t.id===selCase.tierId)||TIERS[0];
     const d=selCase.domainScores||{};
     const detailRecs=buildRecs(selCase.answers||{},selCase.tierId);
-    const typeLabel=TYPE_LABELS[selCase.assessmentType]||"New Patient";
     return(
       <div>
         <button className="back-link" onClick={()=>setScreen("records")}>← Records</button>
         <div className="eyebrow">{selCase.hospital}</div>
         <div className="display" style={{marginBottom:2}}>{selCase.studyId}</div>
-        <div className="caption" style={{marginBottom:4}}>{typeLabel} · {selCase.enrollmentDate}</div>
-        <div style={{marginBottom:20}}/> 
+        <div className="caption" style={{marginBottom:20}}>{selCase.enrollmentDate}</div>
         <div className="score-wrap">
           <div className="score-big">{selCase.score}</div>
           <div className="score-denom">/ 30 pts</div>
@@ -1027,14 +1026,11 @@ export default function F2FApp(){
       <div style={{marginBottom:24}}>
         <div className="settings-label">Make.com Webhook URL</div>
         <div className="alert al-neutral" style={{marginBottom:12}}>
-          <div className="al-body">Paste your Make.com webhook URL here to automatically log Study ID + hospital + date to your OneDrive Excel file when a new patient is enrolled. No PHI is transmitted.</div>
+          <div className="al-body">When you set up Make.com, paste the webhook URL here. The app will automatically send Study ID + hospital + date to your OneDrive Excel de-identification log.</div>
         </div>
-        <input className="settings-input" type="url" placeholder="https://hook.eu1.make.com/…"
-          value={webhookInput} onChange={e=>setWebhookInput(e.target.value)}/>
-        <button className="btn-p" disabled={savingWh} onClick={saveWebhook}>
-          {savingWh?"Saving…":"Save Webhook URL"}
-        </button>
-        {webhookUrl&&<div className="wh-status wh-ok">✓ Webhook configured — active on next new patient enrollment</div>}
+        <input className="settings-input" type="url" placeholder="https://hook.eu1.make.com/…" readOnly
+          value="Not active in session mode — configure in Vercel version"/>
+        <div className="settings-note">Webhook integration requires the Vercel deployment where settings persist.</div>
       </div>
       <div className="rule"/>
       <div style={{marginBottom:24}}>
@@ -1044,7 +1040,7 @@ export default function F2FApp(){
           Fuenmayor PJ, MD · Larkin Community Hospital · Miami<br/>
           FSPS Annual Meeting · December 2025<br/><br/>
           IRB approved: Larkin Community Hospital, Palmetto General Hospital, Delray Medical Center<br/><br/>
-          Data stored locally via localStorage — no PHI retained. Data persists across sessions on this device.
+          Session storage only — deploy to Vercel for full persistence.
         </div>
       </div>
     </div>
@@ -1068,29 +1064,37 @@ export default function F2FApp(){
     </div>
   );
 
+  const showProg=screen==="wizard"&&wizStep<6;
+
   return(
     <>
       <style>{css}</style>
-      <div className="app">
+      <div className={`app fs-${fontSize}`}>
         <header className="hdr">
           <div className="hdr-row">
             <div>
               <div className="hdr-brand">Fitness-to-Flap Score</div>
               <div className="hdr-sub">Pressure Injury Module · Beta v1.1</div>
             </div>
-            {screen==="wizard"&&wizStep<6&&<div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>}
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              {screen==="wizard"&&wizStep<6&&<div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>}
+              <button onClick={cycleFontSize} title="Adjust text size"
+                style={{color:"#aaa",background:"none",border:"1px solid #333",cursor:"pointer",fontFamily:"var(--mono)",fontSize:{sm:10,md:12,lg:15}[fontSize],padding:"2px 7px",lineHeight:1.4,borderRadius:2}}>
+                A{fontSize==="lg"?"⁺":fontSize==="sm"?"⁻":""}
+              </button>
+            </div>
           </div>
           {showProg&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
         </header>
         <main className="main">
-          {screen==="home"       && renderHome()}
-          {screen==="intake"     && renderIntake()}
-          {screen==="id_confirm" && renderIdConfirm()}
-          {screen==="wizard"     && renderWizard()}
-          {screen==="records"    && renderRecords()}
-          {screen==="detail"     && renderDetail()}
-          {screen==="settings"   && renderSettings()}
-          {screen==="about"      && renderAbout()}
+          {screen==="home"        && renderHome()}
+          {screen==="intake"      && renderIntake()}
+          {screen==="id_confirm"  && renderIdConfirm()}
+          {screen==="wizard"      && renderWizard()}
+          {screen==="records"     && renderRecords()}
+          {screen==="detail"      && renderDetail()}
+          {screen==="settings"    && renderSettings()}
+          {screen==="about"       && renderAbout()}
         </main>
       </div>
     </>
