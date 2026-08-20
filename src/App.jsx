@@ -1,10 +1,8 @@
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useEffect } from "react";
 
 /* ═══════════════════════════════════════════════
-   NOTE: This artifact uses session memory only.
-   Data clears when the app reloads. Use the
-   Vercel deployment for full persistence.
-   Copy Results after each session to capture data.
+   F2F Score — Vercel production build
+   Persistent storage via localStorage.
 ═══════════════════════════════════════════════ */
 
 const HOSPITALS = [
@@ -14,6 +12,76 @@ const HOSPITALS = [
   { id:"NLN", name:"Nemours Lake Nona Children's Hospital", short:"Nemours"  },
   { id:"OTH", name:"Other",                                 short:"Other"    },
 ];
+
+/* ═══════════════════════════════════════════════
+   LOCALSTORAGE PERSISTENCE
+═══════════════════════════════════════════════ */
+function lsGet(k){ try{return localStorage.getItem(k);}catch(e){return null;} }
+function lsSet(k,v){ try{localStorage.setItem(k,String(v));return true;}catch(e){return false;} }
+function lsKeys(p){ try{return Object.keys(localStorage).filter(k=>k.startsWith(p));}catch(e){return [];} }
+
+function persistCase(data){
+  const key=`f2f_case_${data.studyId}_${Date.now()}`;
+  lsSet(key,JSON.stringify(data));
+}
+function fetchAllCases(){
+  return lsKeys("f2f_case_").map(k=>{try{return JSON.parse(lsGet(k));}catch(e){return null;}})
+    .filter(Boolean).sort((a,b)=>new Date(b.savedAt)-new Date(a.savedAt));
+}
+function persistOutcome(studyId, data){
+  lsSet(`f2f_outcome_${studyId}`, JSON.stringify(data));
+}
+function fetchOutcome(studyId){
+  const r=lsGet(`f2f_outcome_${studyId}`);
+  if(!r) return null;
+  try{return JSON.parse(r);}catch(e){return null;}
+}
+function fetchAllOutcomes(){
+  return lsKeys("f2f_outcome_").map(k=>{try{return JSON.parse(lsGet(k));}catch(e){return null;}}).filter(Boolean);
+}
+function knownStudyIds(){
+  const ids=new Set();
+  fetchAllCases().forEach(c=>ids.add(c.studyId));
+  return Array.from(ids).sort();
+}
+
+/* ═══════════════════════════════════════════════
+   30-DAY OUTCOME FIELDS (blinded entry)
+═══════════════════════════════════════════════ */
+const OUTCOME_FIELDS = [
+  { id:"cfl",  label:"Complete flap failure",                       hint:"Total or near-total (>75%) flap necrosis requiring debridement or reoperation" },
+  { id:"pfl",  label:"Partial flap failure",                        hint:"Loss of >25% flap surface area requiring unplanned return to OR" },
+  { id:"ssi",  label:"Deep surgical site infection",                hint:"Deep soft tissue/fascia/muscle, culture-confirmed, requiring surgical intervention" },
+  { id:"hem",  label:"Hematoma or seroma requiring evacuation",     hint:"Requiring operative evacuation" },
+  { id:"deh",  label:"Major wound dehiscence",                      hint:"Full-thickness ≥2cm or fascial-level, requiring operative intervention" },
+  { id:"ana",  label:"Free flap anastomotic failure",              hint:"Requiring revision or flap takedown (microsurgical cases only)" },
+  { id:"mort", label:"30-day mortality",                            hint:"All-cause mortality within 30 days" },
+];
+
+/* ═══════════════════════════════════════════════
+   CLAVIEN-DINDO — DERIVED FROM MANAGEMENT LEVEL
+   Residents answer what the complication required;
+   the grade is computed, not judged by hand.
+═══════════════════════════════════════════════ */
+const CD_OPTIONS = [
+  { id:"none",  label:"No complication occurred",
+    detail:"Uncomplicated 30-day course",                                          grade:"None" },
+  { id:"g1",    label:"Managed at bedside only — no added medications",
+    detail:"Wound care, dressing changes, observation (Grade I)",                  grade:"I" },
+  { id:"g2",    label:"Required medication — antibiotics, transfusion, or TPN",
+    detail:"Pharmacologic treatment beyond routine (Grade II)",                    grade:"II" },
+  { id:"g3a",   label:"Required a procedure WITHOUT general anesthesia",
+    detail:"Bedside I&D, aspiration, local intervention (Grade IIIa)",             grade:"IIIa" },
+  { id:"g3b",   label:"Required return to OR under general anesthesia",
+    detail:"Reoperation, operative debridement, flap revision (Grade IIIb)",       grade:"IIIb" },
+  { id:"g4a",   label:"Required ICU management — single organ support",
+    detail:"Single-organ dysfunction, ICU-level care (Grade IVa)",                 grade:"IVa" },
+  { id:"g4b",   label:"Required ICU management — multi-organ support",
+    detail:"Multi-organ dysfunction (Grade IVb)",                                  grade:"IVb" },
+  { id:"g5",    label:"Patient died within 30 days",
+    detail:"30-day mortality (Grade V)",                                           grade:"V" },
+];
+function cdGradeFromOption(id){ return CD_OPTIONS.find(o=>o.id===id)?.grade || ""; }
 
 /* ═══════════════════════════════════════════════
    COPY RESULTS UTILITY
@@ -54,21 +122,31 @@ function buildCopyText(studyId, hospital, enrollDate, answers, score, tier, doma
   ].filter(l=>l!==undefined).join("\n");
 }
 
-function buildSessionCSV(cases) {
+function buildFullCSV(cases, outcomes) {
+  const outMap = {};
+  (outcomes||[]).forEach(o=>{ outMap[o.studyId]=o; });
+  const typeLabel=(t)=>({new:"New Patient",reassessment:"Re-Assessment",preop:"Pre-Operative"}[t]||"New Patient");
   const H = ["Study ID","Assessment Type","Hospital","Enrollment Date",
     "Albumin","Prealbumin","BMI/Weight Loss","PCT","Inflammatory Markers",
     "PI Location","Wound Size","Osteomyelitis","Prior Flap","Soiling","Irradiated Bed",
     "Diabetes HbA1c","Smoking","Cardiopulmonary/Renal","Chronic Steroids",
     "Self-Repositioning","No Pressure Surface","Social Support",
-    "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier","Timestamp"];
+    "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier","Timestamp",
+    // 30-day outcome columns (populated once per Study ID)
+    "Complete Flap Failure","Partial Flap Failure","Deep SSI","Hematoma/Seroma","Major Dehiscence",
+    "Anastomotic Failure","30d Mortality","PRIMARY ENDPOINT","Clavien-Dindo","Outcome Notes","Outcome Recorded"];
   const rows = cases.map(c=>{
-    const a=c.answers||{}; const d=c.domainScores||{};
-    return [c.studyId,c.assessmentType||"New Patient",c.hospital,c.enrollmentDate,
+    const a=c.answers||{}; const d=c.domainScores||{}; const o=outMap[c.studyId];
+    const oc=o?o.outcomes:{};
+    return [c.studyId,typeLabel(c.assessmentType),c.hospital,c.enrollmentDate,
       a.albumin||"",a.prealbumin||"",a.bmi||"",a.pct||"",a.inflammation?"Y":"N",
       a.location||"",a.woundSize||"",a.osteomyelitis||"",a.priorFlap||"",a.soiling||"",a.irradiated?"Y":"N",
       a.diabetes||"",a.smoking||"",a.cardio||"",a.steroids?"Y":"N",
       a.selfReposition||"",a.pressureSurface?"Y":"N",a.socialSupport||"",
-      d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,c.savedAt];
+      d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,c.savedAt,
+      o?(oc.cfl?"Y":"N"):"",o?(oc.pfl?"Y":"N"):"",o?(oc.ssi?"Y":"N"):"",o?(oc.hem?"Y":"N"):"",o?(oc.deh?"Y":"N"):"",
+      o?(oc.ana?"Y":"N"):"",o?(oc.mort?"Y":"N"):"",o?(o.anyEvent?"YES — EVENT":"NO event"):"",
+      o?o.clavienDindo:"",o?o.notes:"",o?o.recordedAt:""];
   });
   return [H,...rows].map(r=>r.map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",")).join("\n");
 }
@@ -182,10 +260,26 @@ const DOMAINS = [
 ];
 
 const TIERS = [
-  {id:"low",      min:0,  max:5,        label:"LOW RISK",               headline:"Proceed with flap reconstruction.",                                                 timing:null},
-  {id:"moderate", min:6,  max:12,       label:"MODERATE RISK",          headline:"Proceed with flap after targeted optimization.",                                    timing:"1–2 weeks"},
-  {id:"high",     min:13, max:19,       label:"HIGH RISK",              headline:"Delay flap. Aggressive multidisciplinary optimization required.",                   timing:"2–4 weeks"},
-  {id:"not_ideal",min:20, max:Infinity, label:"NOT AN IDEAL CANDIDATE", headline:"Avoid major flap reconstruction. Prioritize palliative and wound care strategies.", timing:null},
+  {id:"low",      min:0,  max:5,        label:"LOW RISK",
+    verdict:"Strong candidate for reconstruction",
+    headline:"Proceed with flap reconstruction.",
+    timing:null,
+    bg:"#dcfce7", bar:"#16a34a", ink:"#14532d", accent:"#15803d"},
+  {id:"moderate", min:6,  max:12,       label:"MODERATE RISK",
+    verdict:"Candidate after targeted optimization",
+    headline:"Proceed with flap once the items below are addressed.",
+    timing:"1–2 weeks",
+    bg:"#fef9c3", bar:"#ca8a04", ink:"#713f12", accent:"#a16207"},
+  {id:"high",     min:13, max:19,       label:"HIGH RISK",
+    verdict:"Not a candidate yet — optimize first",
+    headline:"Delay flap. Aggressive multidisciplinary optimization required.",
+    timing:"2–4 weeks",
+    bg:"#ffedd5", bar:"#ea580c", ink:"#7c2d12", accent:"#c2410c"},
+  {id:"not_ideal",min:20, max:Infinity, label:"NOT AN IDEAL CANDIDATE",
+    verdict:"Not a surgical candidate at this time",
+    headline:"Prioritize palliative and advanced wound care rather than major flap reconstruction.",
+    timing:null,
+    bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c"},
 ];
 
 function computeScore(answers) {
@@ -267,17 +361,22 @@ function buildRecs(answers,tierId){
 ═══════════════════════════════════════════════ */
 const css = `
 @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Mono:wght@400;500&display=swap');
+:root{color-scheme:light only;--k:#111;--k2:#333;--k3:#666;--k4:#999;--g1:#f0f0f0;--g2:#e4e4e4;--g3:#ccc;--w:#fff;--r:#c8102e;--serif:'Instrument Serif',serif;--sans:'DM Sans',sans-serif;--mono:'DM Mono',monospace}
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--k:#111;--k2:#333;--k3:#666;--k4:#999;--g1:#f0f0f0;--g2:#e4e4e4;--g3:#ccc;--w:#fff;--r:#c8102e;--serif:'Instrument Serif',serif;--sans:'DM Sans',sans-serif;--mono:'DM Mono',monospace}
-body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smoothing:antialiased}
-.app{min-height:100vh;max-width:460px;margin:0 auto;display:flex;flex-direction:column}
+html{background:#fff;color-scheme:light only}
+body{font-family:var(--sans);background:#fff;color:#111;-webkit-font-smoothing:antialiased}
+/* Force inputs to stay light — some mobile browsers dark-invert form controls */
+input,textarea,button,select{color-scheme:light only}
+input,textarea{background:#fff !important;color:#111 !important;-webkit-text-fill-color:#111}
+input::placeholder,textarea::placeholder{color:#999 !important;-webkit-text-fill-color:#999}
+.app{min-height:100vh;max-width:460px;margin:0 auto;display:flex;flex-direction:column;background:#fff}
 .hdr{background:var(--k);padding:14px 20px;position:sticky;top:0;z-index:50}
 .hdr-row{display:flex;align-items:baseline;justify-content:space-between}
 .hdr-brand{font-family:var(--serif);font-size:18px;color:var(--w);font-style:italic}
 .hdr-step{font-family:var(--mono);font-size:10px;color:#888;letter-spacing:.05em}
 .hdr-sub{font-size:10px;color:#888;letter-spacing:.1em;text-transform:uppercase;margin-top:2px}
-.prog-track{height:1px;background:#333;margin-top:12px}
-.prog-fill{height:100%;background:var(--w);transition:width .35s ease}
+.prog-track{height:6px;background:#333;margin-top:2px;border-radius:3px;overflow:hidden}
+.prog-fill{height:100%;background:linear-gradient(90deg,#fff,#ddd);transition:width .4s cubic-bezier(.4,0,.2,1);border-radius:3px}
 .main{flex:1;padding:24px 20px 48px}
 .eyebrow{font-size:10px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:var(--k4);margin-bottom:6px}
 .display{font-family:var(--serif);font-size:30px;color:var(--k);letter-spacing:-.02em;line-height:1.1;margin-bottom:4px;font-style:italic}
@@ -377,22 +476,6 @@ body{font-family:var(--sans);background:var(--w);color:var(--k);-webkit-font-smo
 .settings-label{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--k4);margin-bottom:10px}
 .settings-input{width:100%;padding:11px 12px;border:1px solid var(--g2);font-family:var(--mono);font-size:12px;color:var(--k);background:var(--w);margin-bottom:8px;outline:none}
 .settings-input:focus{border-color:var(--k)}.settings-note{font-size:12px;color:var(--k4);line-height:1.6}
-
-/* ── FONT SIZE SCALES ── */
-.fs-sm .opt-lbl,.fs-sm .ci-txt,.fs-sm .tog-lbl,.fs-sm .rec-body,.fs-sm .al-body,.fs-sm .settings-note{font-size:11px}
-.fs-sm .qlabel,.fs-sm .caption,.fs-sm .hosp-name,.fs-sm p{font-size:11px}
-.fs-sm .opt,.fs-sm .ci-row{padding:8px 10px}
-.fs-sm .qhint,.fs-sm .tog-hint,.fs-sm .records-count,.fs-sm .record-meta{font-size:10px}
-.fs-sm .btn-p,.fs-sm .btn-s,.fs-sm .home-btn-new,.fs-sm .home-btn-sec{font-size:12px}
-
-.fs-lg .opt-lbl,.fs-lg .ci-txt,.fs-lg .tog-lbl,.fs-lg .rec-body,.fs-lg .al-body,.fs-lg .settings-note{font-size:16px}
-.fs-lg .qlabel,.fs-lg .caption,.fs-lg .hosp-name,.fs-lg p{font-size:16px}
-.fs-lg .opt,.fs-lg .ci-row{padding:14px 14px}
-.fs-lg .qhint,.fs-lg .tog-hint{font-size:14px}
-.fs-lg .btn-p,.fs-lg .btn-s,.fs-lg .home-btn-new,.fs-lg .home-btn-sec{font-size:16px;padding:16px 20px}
-.fs-lg .opt-pts{font-size:13px}
-.fs-lg .tbtn{font-size:14px;padding:8px 16px}
-.fs-lg .confirm-chk-text{font-size:16px}
 `;
 
 /* ═══════════════════════════════════════════════
@@ -457,9 +540,6 @@ function TierChip({tierId}){
 const TOTAL_WIZ=6;
 
 export default function F2FApp(){
-  // Session-only counters (reset on reload — use Vercel version for persistence)
-  const counters = useRef({LCH:0,PGH:0,DMC:0,NLN:0,OTH:0});
-
   const [screen,        setScreen]        = useState("home");
   const [wizStep,       setWizStep]       = useState(1);
   const [ciChecked,     setCiChecked]     = useState({});
@@ -472,13 +552,28 @@ export default function F2FApp(){
   const [assessType,    setAssessType]    = useState(null);
   const [existingId,    setExistingId]    = useState("");
   const [manualId,      setManualId]      = useState("");
-  const [sessionCases,  setSessionCases]  = useState([]);
+  const [cases,         setCases]         = useState([]);
   const [selCase,       setSelCase]       = useState(null);
   const [copied,        setCopied]        = useState(false);
   const [copyFallback,  setCopyFallback]  = useState(false);
   const [copyText,      setCopyText]      = useState("");
   const [fieldStep,     setFieldStep]     = useState(0);
-  const [fontSize,      setFontSize]      = useState(()=>{ try{return localStorage.getItem("f2f_fontsize")||"md";}catch(e){return "md";} });
+  const [isQuick,       setIsQuick]       = useState(false);   // Quick Score — not saved
+  const [outStudyId,    setOutStudyId]    = useState("");      // Outcomes lookup
+  const [outFields,     setOutFields]     = useState({});      // Outcome answers
+  const [outCD,         setOutCD]         = useState("");      // Clavien-Dindo (derived grade)
+  const [outCDOption,   setOutCDOption]   = useState("");      // selected management-level option id
+  const [outNotes,      setOutNotes]      = useState("");
+  const [outSaved,      setOutSaved]      = useState(false);
+  const [openRecs,      setOpenRecs]      = useState({}); // collapsible non-urgent rec categories
+  const [fontLevel,     setFontLevel]     = useState(()=>{ try{return parseInt(localStorage.getItem("f2f_fontlevel"))||2;}catch(e){return 2;} });
+  const FONT_SCALE = {1:0.9, 2:1.0, 3:1.15, 4:1.35};
+  const setFont=(lvl)=>{ setFontLevel(lvl); try{localStorage.setItem("f2f_fontlevel",String(lvl));}catch(e){} };
+
+  // Load persisted cases on mount
+  useEffect(()=>{
+    setCases(fetchAllCases());
+  },[]);
 
   // ── Per-domain page layout: each radio = own page, all toggles grouped at end
   function getDomainPages(d){
@@ -496,11 +591,6 @@ export default function F2FApp(){
 
   const updateAnswer=(id,val)=>setAnswers(p=>({...p,[id]:val}));
   const toggleFlag=(id)=>setCiChecked(p=>({...p,[id]:!p[id]}));
-  const cycleFontSize=()=>setFontSize(s=>{
-    const next={sm:"md",md:"lg",lg:"sm"}[s]||"md";
-    try{localStorage.setItem("f2f_fontsize",next);}catch(e){}
-    return next;
-  });
 
   const isCurrentPageComplete=useMemo(()=>{
     if(!currentPage) return true;
@@ -532,21 +622,30 @@ export default function F2FApp(){
     setCopied(false); setCopyFallback(false); setScreen("wizard");
   }
 
+  function startQuickScore(){
+    // Unsaved teaching/demo mode — no Study ID, no record
+    setIsQuick(true); setAssessType(null); setStudyId(null); setHospital(null);
+    setEnrollDate(null); setWizStep(1); setFieldStep(0); setCiChecked({}); setAnswers({});
+    setCopied(false); setCopyFallback(false); setScreen("wizard");
+  }
+
   function goNextWiz(){
     if(wizStep===1&&hasRedFlag) return;
     if(wizStep>=2&&wizStep<=5){
       if(!isCurrentPageComplete) return;
       if(fieldStep<domainPages.length-1){ setFieldStep(f=>f+1); return; }
-      // last page of domain
       if(wizStep===5){
         setWizStep(6); setFieldStep(0);
-        const caseData={
-          studyId, hospital:hospital.name, hospitalId:hospital.id, enrollmentDate:enrollDate,
-          assessmentType:assessType||"new",
-          savedAt:new Date().toISOString(), answers:{...answers}, score:total,
-          tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
-        };
-        setSessionCases(prev=>[...prev.filter(c=>c.studyId!==studyId),caseData]);
+        if(!isQuick){
+          const caseData={
+            studyId, hospital:hospital.name, hospitalId:hospital.id, enrollmentDate:enrollDate,
+            assessmentType:assessType||"new",
+            savedAt:new Date().toISOString(), answers:{...answers}, score:total,
+            tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
+          };
+          persistCase(caseData);
+          setCases(fetchAllCases());
+        }
       } else {
         setWizStep(s=>s+1); setFieldStep(0);
       }
@@ -576,7 +675,7 @@ export default function F2FApp(){
 
   function handleCopy(){
     const aLabel={new:"New Patient",reassessment:"Re-Assessment",preop:"Pre-Operative"}[assessType]||"New Patient";
-    const text=buildCopyText(studyId,hospital.name,enrollDate,answers,total,tier,domainScores,aLabel);
+    const text=buildCopyText(studyId||"QUICK-SCORE",hospital?.name||"—",enrollDate||new Date().toISOString().split("T")[0],answers,total,tier,domainScores,isQuick?"Quick Score (not saved)":aLabel);
     setCopyText(text);
     if(navigator.clipboard?.writeText){
       navigator.clipboard.writeText(text)
@@ -587,20 +686,45 @@ export default function F2FApp(){
     }
   }
 
-  function exportSessionCSV(){
-    if(sessionCases.length===0) return;
-    const csv=buildSessionCSV(sessionCases);
+  function exportAllCSV(){
+    const all=fetchAllCases();
+    if(all.length===0) return;
+    const outcomes=fetchAllOutcomes();
+    const csv=buildFullCSV(all,outcomes);
     const a=document.createElement("a");
     a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-    a.download=`F2F_Session_${enrollDate||"data"}.csv`;
+    a.download=`F2F_Data_${new Date().toISOString().split("T")[0]}.csv`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  }
+
+  function saveOutcome(){
+    const sid=outStudyId.trim().toUpperCase();
+    if(sid.length<4) return;
+    const derivedGrade=cdGradeFromOption(outCDOption);
+    const data={
+      studyId:sid,
+      outcomes:{...outFields},
+      clavienDindo:derivedGrade,
+      cdOption:outCDOption,
+      notes:outNotes,
+      anyEvent:OUTCOME_FIELDS.some(f=>outFields[f.id]===true),
+      recordedAt:new Date().toISOString(),
+    };
+    persistOutcome(sid,data);
+    setOutCD(derivedGrade);
+    setOutSaved(true);
+  }
+
+  function resetOutcome(){
+    setOutStudyId(""); setOutFields({}); setOutCD(""); setOutCDOption(""); setOutNotes(""); setOutSaved(false);
   }
 
   function resetAll(){
     setScreen("home"); setWizStep(1); setFieldStep(0); setCiChecked({}); setAnswers({});
     setHospital(null); setStudyId(null); setEnrollDate(null); setDeIdDone(false);
     setSelectedHosp(null); setAssessType(null); setExistingId(""); setManualId("");
-    setCopied(false); setCopyFallback(false); setSelCase(null);
+    setCopied(false); setCopyFallback(false); setSelCase(null); setIsQuick(false); setOpenRecs({});
+    setCases(fetchAllCases());
   }
 
   /* ══════════════════════════════════════════
@@ -614,14 +738,16 @@ export default function F2FApp(){
         <div className="home-sub">Pre-operative risk stratification · Pressure Injury Module v1.1</div>
       </div>
       <div className="home-btns">
-        <button className="home-btn-new" onClick={()=>setScreen("intake")}>New Patient Assessment</button>
-        <button className="home-btn-sec" onClick={()=>setScreen("records")}>
-          Session Records {sessionCases.length>0&&`(${sessionCases.length})`}
+        <button className="home-btn-new" onClick={()=>{setIsQuick(false);setScreen("intake");}}>New Patient Assessment</button>
+        <button className="home-btn-sec" onClick={()=>{setCases(fetchAllCases());setScreen("records");}}>
+          Patient Records {cases.length>0&&`(${cases.length})`}
         </button>
-      </div>
-      <div className="alert al-amber">
-        <div className="al-title" style={{color:"#92400e"}}>Session Storage — Data Clears on Reload</div>
-        <div className="al-body" style={{color:"#78350f"}}>This app runs in session memory only. Always use <strong>Copy Results</strong> after each patient to capture data before closing. For persistent storage, use the Vercel-deployed version.</div>
+        <button className="home-btn-sec" onClick={()=>{resetOutcome();setScreen("outcomes");}}>
+          Enter 30-Day Outcomes
+        </button>
+        <button className="home-btn-sec" style={{borderStyle:"dashed"}} onClick={startQuickScore}>
+          Quick Score — not saved
+        </button>
       </div>
       <div className="alert al-dark" style={{marginBottom:20}}>
         <div className="al-title" style={{color:"var(--k)"}}>Clinical Disclaimer</div>
@@ -790,8 +916,10 @@ export default function F2FApp(){
   const renderWizard=()=>(
     <div>
       <div className="study-id-badge">
-        {studyId} · {hospital?.short}
-        {assessType&&assessType!=="new"&&<span style={{marginLeft:8,color:"var(--r)",fontWeight:700}}>· {assessLabel}</span>}
+        {isQuick
+          ? <span style={{color:"var(--r)",fontWeight:700}}>QUICK SCORE · not saved</span>
+          : <>{studyId} · {hospital?.short}{assessType&&assessType!=="new"&&<span style={{marginLeft:8,color:"var(--r)",fontWeight:700}}>· {assessLabel}</span>}</>
+        }
       </div>
 
       {wizStep===1&&(
@@ -866,28 +994,52 @@ export default function F2FApp(){
         <div>
           <div style={{textAlign:"center",marginBottom:6}}>
             <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.1em",color:"#94a3b8"}}>F2F Score Result</div>
-            <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--k4)",marginTop:2}}>{studyId} · {hospital?.short} · {assessLabel||"New Patient"}</div>
-            <div style={{fontSize:10,color:"var(--k4)",marginTop:3,letterSpacing:".08em",textTransform:"uppercase"}}>
-              {assessType==="reassessment"&&"Re-Assessment"}
-              {assessType==="preop"&&"Pre-Operative Score"}
-              {assessType==="new"&&"Initial Assessment"}
+            {isQuick
+              ? <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--r)",marginTop:2,fontWeight:700}}>QUICK SCORE — not saved to study</div>
+              : <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--k4)",marginTop:2}}>{studyId} · {hospital?.short} · {assessLabel||"New Patient"}</div>
+            }
+          </div>
+
+          {/* ══ VERDICT PANEL — dramatic, colored by tier ══ */}
+          <div style={{background:tier.bg,borderRadius:14,padding:"28px 22px 24px",marginBottom:20,textAlign:"center",border:`1px solid ${tier.bar}22`}}>
+            {/* Score number + denom */}
+            <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,marginBottom:4}}>
+              <span style={{fontFamily:"var(--serif)",fontSize:72,fontStyle:"italic",lineHeight:1,letterSpacing:"-.04em",color:tier.ink}}>{total}</span>
+              <span style={{fontFamily:"var(--mono)",fontSize:15,color:tier.accent}}>/ 30</span>
+            </div>
+
+            {/* Tier label — large and bold */}
+            <div style={{fontSize:38,fontWeight:800,lineHeight:1.05,letterSpacing:"-.02em",color:tier.ink,marginTop:12,marginBottom:6}}>
+              {tier.label}
+            </div>
+
+            {/* Plain-language verdict — states good or not */}
+            <div style={{fontSize:16,fontWeight:700,color:tier.accent,marginBottom:14,lineHeight:1.3}}>
+              {tier.verdict}
+            </div>
+
+            {/* Primary recommendation — bold, high contrast */}
+            <div style={{background:"#fff",borderRadius:10,padding:"14px 16px",marginTop:4}}>
+              <div style={{fontSize:9,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:tier.accent,marginBottom:5}}>Recommendation</div>
+              <div style={{fontSize:15,fontWeight:600,color:"#111",lineHeight:1.45}}>{tier.headline}</div>
+              {tier.timing&&(
+                <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:12,color:tier.accent,fontWeight:600,letterSpacing:".04em"}}>
+                  ⏱ OPTIMIZATION WINDOW · {tier.timing}
+                </div>
+              )}
             </div>
           </div>
 
-          <div className="score-wrap">
-            <div className="score-big">{total}</div>
-            <div className="score-denom">/ 30 pts</div>
-            <div className="tier-lbl">{tier.label}</div>
-            <div className="tier-headline">{tier.headline}</div>
-            {tier.timing&&<div className="timing">Optimization window · {tier.timing}</div>}
-          </div>
+          {!isQuick&&(
+            <div className="alert al-green" style={{marginBottom:16}}>
+              <div className="al-body" style={{color:"#15803d"}}>✓ Saved to Patient Records as <strong>{studyId}</strong> ({assessLabel}). Persists on this device.</div>
+            </div>
+          )}
 
-          {/* COPY RESULTS — primary action on mobile */}
           <div style={{marginBottom:20}}>
             <button className={`copy-btn ${copied?"copied":""}`} onClick={handleCopy}>
               {copied?"✓ Copied to clipboard":"📋 Copy Results to Clipboard"}
             </button>
-            {!copied&&<div style={{textAlign:"center",fontSize:11,color:"var(--r)",marginBottom:8,fontWeight:600}}>⚠ Copy before closing — data clears on reload</div>}
             {copyFallback&&(
               <div>
                 <div style={{fontSize:11,color:"var(--k4)",marginBottom:4}}>Clipboard unavailable — select all and copy manually:</div>
@@ -926,7 +1078,56 @@ export default function F2FApp(){
           <div style={{marginBottom:24}}>
             <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:4}}>Patient-Specific Action Plan</div>
             <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:16}}>{recs.length} item{recs.length!==1?"s":""} · sorted by priority · <span style={{color:"var(--r)"}}>● urgent</span></div>
-            {recs.map((r,i)=><RecCard key={i} rec={r} index={i}/>)}
+
+            {(()=>{
+              const urgent=recs.filter(r=>r.p===1);
+              const rest=recs.filter(r=>r.p!==1);
+              return(
+                <>
+                  {/* Urgent — always visible, prominent */}
+                  {urgent.length>0&&(
+                    <div style={{marginBottom:rest.length>0?20:0}}>
+                      <div style={{fontSize:10,fontWeight:800,letterSpacing:".1em",textTransform:"uppercase",color:"var(--r)",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{width:6,height:6,background:"var(--r)",borderRadius:"50%",display:"inline-block"}}/>
+                        Urgent — Act Immediately
+                      </div>
+                      {urgent.map((r,i)=>(
+                        <div key={i} style={{border:"1px solid var(--r)",borderLeft:"3px solid var(--r)",borderRadius:8,padding:"14px 16px",marginBottom:8,background:"#fff8f8"}}>
+                          <div style={{fontSize:12.5,fontWeight:700,color:"var(--r)",marginBottom:6,lineHeight:1.3}}>{r.cat}</div>
+                          <div style={{fontSize:13,color:"var(--k2)",lineHeight:1.7}}>{r.text}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Non-urgent — collapsible category rows */}
+                  {rest.length>0&&(
+                    <div>
+                      {urgent.length>0&&(
+                        <div style={{fontSize:10,fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",color:"var(--k4)",marginBottom:10}}>
+                          Additional Optimization · tap to expand
+                        </div>
+                      )}
+                      {rest.map((r,i)=>{
+                        const isOpen=openRecs[`${r.cat}_${i}`]??false;
+                        return(
+                          <div key={i} style={{border:"1px solid var(--g2)",borderRadius:8,marginBottom:6,overflow:"hidden"}}>
+                            <button onClick={()=>setOpenRecs(p=>({...p,[`${r.cat}_${i}`]:!isOpen}))}
+                              style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,padding:"12px 14px",background:isOpen?"var(--g1)":"#fff",border:"none",cursor:"pointer",fontFamily:"var(--sans)",textAlign:"left"}}>
+                              <span style={{fontSize:12.5,fontWeight:600,color:"var(--k)",lineHeight:1.3}}>{r.cat}</span>
+                              <span style={{fontFamily:"var(--mono)",fontSize:16,color:"var(--k4)",flexShrink:0,transform:isOpen?"rotate(45deg)":"none",transition:"transform .15s"}}>+</span>
+                            </button>
+                            {isOpen&&(
+                              <div style={{padding:"0 14px 14px",fontSize:13,color:"var(--k3)",lineHeight:1.7}}>{r.text}</div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
 
           <div style={{marginBottom:24}}>
@@ -949,40 +1150,68 @@ export default function F2FApp(){
     </div>
   );
 
-  const renderRecords=()=>(
-    <div>
-      <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
-      <div className="records-header">
-        <div>
-          <div className="display" style={{fontSize:24,marginBottom:2}}>Session Records</div>
-          <div className="records-count">{sessionCases.length} case{sessionCases.length!==1?"s":""} · clears on reload</div>
-        </div>
-        {sessionCases.length>0&&<button className="export-btn" onClick={exportSessionCSV}>Export CSV</button>}
-      </div>
-      <div className="alert al-amber" style={{marginBottom:16}}>
-        <div className="al-body" style={{color:"#78350f"}}>Session data only. Export CSV or Copy Results before closing the app. For persistent storage, deploy the Vercel version.</div>
-      </div>
-      {sessionCases.length===0&&(
-        <div className="empty-state">
-          <div className="empty-icon">📋</div>
-          <div className="empty-text">No cases in this session</div>
-          <div className="empty-sub">Complete a patient assessment to see it here</div>
-        </div>
-      )}
-      {sessionCases.map(c=>(
-        <div key={c.studyId} className="record-item" onClick={()=>{setSelCase(c);setScreen("detail");}}>
-          <div className="record-left">
-            <div className="record-id">{c.studyId}</div>
-            <div className="record-meta">{c.hospital} · {c.enrollmentDate}</div>
+  const renderRecords=()=>{
+    const outcomes=fetchAllOutcomes();
+    const outSet=new Set(outcomes.map(o=>o.studyId));
+    // Group by studyId
+    const groups={};
+    cases.forEach(c=>{ (groups[c.studyId]=groups[c.studyId]||[]).push(c); });
+    const groupList=Object.entries(groups).sort((a,b)=>{
+      const al=Math.max(...a[1].map(c=>new Date(c.savedAt)));
+      const bl=Math.max(...b[1].map(c=>new Date(c.savedAt)));
+      return bl-al;
+    });
+    const TYPE_ICON={new:"✦",reassessment:"↺",preop:"✓"};
+    const TYPE_LABEL={new:"New Patient",reassessment:"Re-Assessment",preop:"Pre-Operative"};
+    return(
+      <div>
+        <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
+        <div className="records-header">
+          <div>
+            <div className="display" style={{fontSize:24,marginBottom:2}}>Patient Records</div>
+            <div className="records-count">{cases.length} record{cases.length!==1?"s":""} · persistent · no PHI</div>
           </div>
-          <div className="record-right">
-            <span className="record-score">{c.score}</span>
-            <TierChip tierId={c.tierId}/>
-          </div>
+          {cases.length>0&&<button className="export-btn" onClick={exportAllCSV}>Export CSV</button>}
         </div>
-      ))}
-    </div>
-  );
+        {cases.length===0&&(
+          <div className="empty-state">
+            <div className="empty-icon">📋</div>
+            <div className="empty-text">No records yet</div>
+            <div className="empty-sub">Complete a patient assessment to see it here</div>
+          </div>
+        )}
+        {groupList.map(([sid,sCases])=>{
+          const sorted=[...sCases].sort((a,b)=>new Date(a.savedAt)-new Date(b.savedAt));
+          const hasOutcome=outSet.has(sid);
+          return(
+            <div key={sid} style={{marginBottom:20}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",paddingBottom:6,borderBottom:"1.5px solid var(--k)",marginBottom:6}}>
+                <span style={{fontFamily:"var(--mono)",fontSize:13,fontWeight:700}}>{sid}</span>
+                <span style={{fontSize:11,color:hasOutcome?"#15803d":"var(--k4)",fontWeight:hasOutcome?700:400}}>
+                  {hasOutcome?"✓ 30-day outcome recorded":sorted[0]?.hospital}
+                </span>
+              </div>
+              {sorted.map((c,i)=>(
+                <div key={i} className="record-item" onClick={()=>{setSelCase(c);setScreen("detail");}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,flex:1}}>
+                    <span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--k4)",width:14}}>{TYPE_ICON[c.assessmentType]||"✦"}</span>
+                    <div>
+                      <div style={{fontSize:12.5,color:"var(--k)",fontWeight:500}}>{TYPE_LABEL[c.assessmentType]||"New Patient"}</div>
+                      <div style={{fontSize:11,color:"var(--k4)",marginTop:1}}>{c.enrollmentDate}</div>
+                    </div>
+                  </div>
+                  <div className="record-right">
+                    <span className="record-score">{c.score}</span>
+                    <TierChip tierId={c.tierId}/>
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   const renderDetail=()=>{
     if(!selCase) return null;
@@ -995,11 +1224,17 @@ export default function F2FApp(){
         <div className="eyebrow">{selCase.hospital}</div>
         <div className="display" style={{marginBottom:2}}>{selCase.studyId}</div>
         <div className="caption" style={{marginBottom:20}}>{selCase.enrollmentDate}</div>
-        <div className="score-wrap">
-          <div className="score-big">{selCase.score}</div>
-          <div className="score-denom">/ 30 pts</div>
-          <div className="tier-lbl">{t.label}</div>
-          <div className="tier-headline">{t.headline}</div>
+        <div style={{background:t.bg,borderRadius:14,padding:"22px 20px",marginBottom:24,textAlign:"center",border:`1px solid ${t.bar}22`}}>
+          <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6}}>
+            <span style={{fontFamily:"var(--serif)",fontSize:56,fontStyle:"italic",lineHeight:1,letterSpacing:"-.04em",color:t.ink}}>{selCase.score}</span>
+            <span style={{fontFamily:"var(--mono)",fontSize:13,color:t.accent}}>/ 30</span>
+          </div>
+          <div style={{fontSize:28,fontWeight:800,letterSpacing:"-.02em",color:t.ink,marginTop:8,marginBottom:4}}>{t.label}</div>
+          <div style={{fontSize:14,fontWeight:700,color:t.accent,marginBottom:10}}>{t.verdict}</div>
+          <div style={{background:"#fff",borderRadius:8,padding:"12px 14px",fontSize:13.5,fontWeight:600,color:"#111",lineHeight:1.45}}>
+            {t.headline}
+            {t.timing&&<div style={{marginTop:8,paddingTop:8,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:11,color:t.accent,fontWeight:600}}>⏱ {t.timing}</div>}
+          </div>
         </div>
         <div style={{marginBottom:24}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
@@ -1017,6 +1252,112 @@ export default function F2FApp(){
     );
   };
 
+  const renderOutcomes=()=>{
+    const sid=outStudyId.trim().toUpperCase();
+    const known=knownStudyIds();
+    const existing=fetchOutcome(sid);
+    return(
+      <div>
+        <button className="back-link" onClick={()=>{setScreen("home");resetOutcome();}}>← Home</button>
+        <div className="eyebrow">30-Day Follow-Up</div>
+        <div className="display" style={{marginBottom:4}}>Outcome Entry</div>
+        <div className="caption" style={{marginBottom:16}}>Blinded outcome adjudication. Enter the Study ID and record 30-day endpoints. The pre-operative F2F Score is intentionally hidden to preserve blinding.</div>
+
+        {outSaved?(
+          <div>
+            <div className="alert al-green" style={{marginBottom:16}}>
+              <div className="al-title" style={{color:"#15803d"}}>Outcome Recorded</div>
+              <div className="al-body" style={{color:"#15803d"}}>30-day outcome for <strong>{sid}</strong> saved. Primary endpoint: <strong>{OUTCOME_FIELDS.some(f=>outFields[f.id]===true)?"YES — EVENT":"NO event"}</strong>.{outCD&&outCD!=="None"&&<> Clavien-Dindo grade: <strong>{outCD}</strong>.</>}</div>
+            </div>
+            <button className="btn-p" onClick={resetOutcome}>Enter Another Outcome</button>
+            <button className="btn-s" style={{width:"100%",marginTop:8}} onClick={()=>{setScreen("home");resetOutcome();}}>Done</button>
+          </div>
+        ):(
+          <div>
+            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"var(--k4)",marginBottom:6}}>Study ID</div>
+            <input
+              style={{width:"100%",padding:"12px 14px",border:"1.5px solid var(--k)",fontFamily:"var(--mono)",fontSize:20,fontWeight:700,color:"var(--k)",background:"var(--w)",letterSpacing:".06em",textTransform:"uppercase",outline:"none",marginBottom:4}}
+              placeholder="e.g. LCH-001"
+              value={outStudyId}
+              onChange={e=>{setOutStudyId(e.target.value.toUpperCase());setOutSaved(false);}}
+            />
+            {sid.length>=4&&!known.includes(sid)&&(
+              <div style={{fontSize:11,color:"#b45309",marginBottom:8}}>⚠ No scored assessment found for this ID on this device. You can still record the outcome — verify the ID is correct.</div>
+            )}
+            {sid.length>=4&&known.includes(sid)&&(
+              <div style={{fontSize:11,color:"#15803d",marginBottom:8}}>✓ Study ID found in records</div>
+            )}
+            {existing&&(
+              <div className="alert al-amber" style={{marginTop:8,marginBottom:8}}>
+                <div className="al-body" style={{color:"#78350f"}}>An outcome already exists for {sid} (recorded {existing.recordedAt?.split("T")[0]}). Saving will overwrite it.</div>
+              </div>
+            )}
+
+            {sid.length>=4&&(
+              <>
+                <div className="rule"/>
+                <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"var(--k4)",marginBottom:4}}>30-Day Major Complications</div>
+                <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:12}}>Mark any that occurred within 30 days of the index procedure.</div>
+                {OUTCOME_FIELDS.map(f=>(
+                  <div className="tog" key={f.id}>
+                    <div style={{flex:1}}>
+                      <div className="tog-lbl">{f.label}</div>
+                      <div className="tog-hint">{f.hint}</div>
+                    </div>
+                    <div className="tog-btns">
+                      <button className={`tbtn ${outFields[f.id]===false?"on-no":""}`} onClick={()=>setOutFields(p=>({...p,[f.id]:false}))}>No</button>
+                      <button className={`tbtn ${outFields[f.id]===true?"on-yes":""}`} onClick={()=>setOutFields(p=>({...p,[f.id]:true}))}>Yes</button>
+                    </div>
+                  </div>
+                ))}
+
+                <div style={{marginTop:24}}>
+                  <div className="qlabel" style={{marginBottom:2}}>Severity — Level of Management Required</div>
+                  <div className="qhint" style={{marginBottom:10}}>Select the most intensive treatment the complication required. The Clavien-Dindo grade is calculated automatically — you do not need to know the classification.</div>
+                  {CD_OPTIONS.map(o=>{
+                    const sel=outCDOption===o.id;
+                    return(
+                      <button key={o.id} className={`opt ${sel?"sel":""}`} style={{alignItems:"flex-start"}}
+                        onClick={()=>setOutCDOption(o.id)}>
+                        <span style={{flex:1}}>
+                          <span className={`opt-lbl ${sel?"sel":""}`} style={{display:"block"}}>{o.label}</span>
+                          <span style={{fontSize:11,color:"var(--k4)",marginTop:2,display:"block"}}>{o.detail}</span>
+                        </span>
+                        {o.grade!=="None"&&<span className={`opt-pts ${sel?"sel":""}`}>{o.grade}</span>}
+                      </button>
+                    );
+                  })}
+                  {outCDOption&&cdGradeFromOption(outCDOption)!=="None"&&(
+                    <div style={{marginTop:8,padding:"10px 12px",background:"var(--g1)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:11.5,color:"var(--k4)"}}>Calculated Clavien-Dindo grade</span>
+                      <span style={{fontFamily:"var(--mono)",fontSize:15,fontWeight:700,color:"var(--k)"}}>{cdGradeFromOption(outCDOption)}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{marginTop:20}}>
+                  <div className="qlabel" style={{marginBottom:8}}>Comments (optional)</div>
+                  <textarea rows={3} value={outNotes} onChange={e=>setOutNotes(e.target.value)}
+                    placeholder="Any additional detail on complications, readmission, reoperation, or context…"
+                    style={{width:"100%",padding:"11px 12px",border:"1px solid var(--g2)",fontFamily:"var(--sans)",fontSize:13,color:"#111",background:"#fff",outline:"none",resize:"vertical"}}/>
+                </div>
+
+                <div style={{marginTop:16,padding:"12px 14px",background:"var(--g1)"}}>
+                  <div style={{fontSize:11,color:"var(--k4)",marginBottom:2}}>Primary endpoint (auto)</div>
+                  <div style={{fontSize:15,fontWeight:700,color:OUTCOME_FIELDS.some(f=>outFields[f.id]===true)?"var(--r)":"var(--k)"}}>
+                    {OUTCOME_FIELDS.some(f=>outFields[f.id]===true)?"YES — EVENT":"NO event"}
+                  </div>
+                </div>
+
+                <button className="btn-p" style={{marginTop:16}} onClick={saveOutcome}>Save 30-Day Outcome</button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const renderSettings=()=>(
     <div>
       <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
@@ -1024,13 +1365,30 @@ export default function F2FApp(){
       <div className="display" style={{marginBottom:4,fontSize:24}}>Settings</div>
       <div className="rule"/>
       <div style={{marginBottom:24}}>
-        <div className="settings-label">Make.com Webhook URL</div>
-        <div className="alert al-neutral" style={{marginBottom:12}}>
-          <div className="al-body">When you set up Make.com, paste the webhook URL here. The app will automatically send Study ID + hospital + date to your OneDrive Excel de-identification log.</div>
+        <div className="settings-label">Research Data</div>
+        <div className="settings-note" style={{marginBottom:12}}>
+          All scored assessments and 30-day outcomes are stored locally on this device. Export the full dataset as a CSV to merge into your master research spreadsheet.
         </div>
-        <input className="settings-input" type="url" placeholder="https://hook.eu1.make.com/…" readOnly
-          value="Not active in session mode — configure in Vercel version"/>
-        <div className="settings-note">Webhook integration requires the Vercel deployment where settings persist.</div>
+        <button className="btn-p" onClick={exportAllCSV} disabled={cases.length===0}>
+          Export All Data (CSV)
+        </button>
+        <div style={{marginTop:8,fontSize:11,color:"var(--k4)",fontFamily:"var(--mono)"}}>
+          {cases.length} record{cases.length!==1?"s":""} stored · no PHI
+        </div>
+      </div>
+      <div className="rule"/>
+      <div style={{marginBottom:24}}>
+        <div className="settings-label">Text Size</div>
+        <div className="settings-note" style={{marginBottom:10}}>Adjust text size for readability. Also available via the A A A A control in the header.</div>
+        <div style={{display:"flex",gap:6}}>
+          {[[1,"Small"],[2,"Default"],[3,"Large"],[4,"Largest"]].map(([lvl,lbl])=>(
+            <button key={lvl} onClick={()=>setFont(lvl)}
+              style={{flex:1,padding:"12px 4px",border:`1px solid ${fontLevel===lvl?"var(--k)":"var(--g2)"}`,background:fontLevel===lvl?"var(--k)":"#fff",color:fontLevel===lvl?"#fff":"#111",fontFamily:"var(--serif)",fontStyle:"italic",fontSize:[13,15,18,22][lvl-1],fontWeight:600,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+              A
+              <span style={{fontFamily:"var(--sans)",fontStyle:"normal",fontSize:10,fontWeight:500}}>{lbl}</span>
+            </button>
+          ))}
+        </div>
       </div>
       <div className="rule"/>
       <div style={{marginBottom:24}}>
@@ -1040,7 +1398,7 @@ export default function F2FApp(){
           Fuenmayor PJ, MD · Larkin Community Hospital · Miami<br/>
           FSPS Annual Meeting · December 2025<br/><br/>
           IRB approved: Larkin Community Hospital, Palmetto General Hospital, Delray Medical Center<br/><br/>
-          Session storage only — deploy to Vercel for full persistence.
+          Data stored locally on this device via localStorage — no PHI retained. Records persist across sessions.
         </div>
       </div>
     </div>
@@ -1069,24 +1427,44 @@ export default function F2FApp(){
   return(
     <>
       <style>{css}</style>
-      <div className={`app fs-${fontSize}`}>
+      <div className="app">
         <header className="hdr">
           <div className="hdr-row">
             <div>
               <div className="hdr-brand">Fitness-to-Flap Score</div>
               <div className="hdr-sub">Pressure Injury Module · Beta v1.1</div>
             </div>
-            <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
               {screen==="wizard"&&wizStep<6&&<div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>}
-              <button onClick={cycleFontSize} title="Adjust text size"
-                style={{color:"#aaa",background:"none",border:"1px solid #333",cursor:"pointer",fontFamily:"var(--mono)",fontSize:{sm:10,md:12,lg:15}[fontSize],padding:"2px 7px",lineHeight:1.4,borderRadius:2}}>
-                A{fontSize==="lg"?"⁺":fontSize==="sm"?"⁻":""}
-              </button>
+              <div style={{display:"flex",alignItems:"baseline",gap:1,border:"1px solid #333",borderRadius:4,padding:"2px 3px"}}>
+                {[1,2,3,4].map(lvl=>(
+                  <button key={lvl} onClick={()=>setFont(lvl)} title={`Text size ${lvl}`}
+                    style={{
+                      background:fontLevel===lvl?"#fff":"none",
+                      color:fontLevel===lvl?"#111":"#888",
+                      border:"none",cursor:"pointer",fontFamily:"var(--serif)",fontStyle:"italic",
+                      fontSize:[11,13,15,18][lvl-1],lineHeight:1,padding:"3px 5px",borderRadius:2,
+                      fontWeight:600,transition:"all .1s",minWidth:20,
+                    }}>
+                    A
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
-          {showProg&&<div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>}
+          {showProg&&(
+            <div style={{marginTop:12}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+                <span style={{fontFamily:"var(--mono)",fontSize:9,color:"#888",letterSpacing:".08em",textTransform:"uppercase"}}>
+                  {wizStep===1?"Pre-Screen":`Domain ${wizStep-1} of 4`}
+                </span>
+                <span style={{fontFamily:"var(--mono)",fontSize:9,color:"#bbb",fontWeight:500}}>{pct}% complete</span>
+              </div>
+              <div className="prog-track"><div className="prog-fill" style={{width:`${pct}%`}}/></div>
+            </div>
+          )}
         </header>
-        <main className="main">
+        <main className="main" style={{zoom:FONT_SCALE[fontLevel]}}>
           {screen==="home"        && renderHome()}
           {screen==="intake"      && renderIntake()}
           {screen==="id_confirm"  && renderIdConfirm()}
@@ -1094,6 +1472,7 @@ export default function F2FApp(){
           {screen==="records"     && renderRecords()}
           {screen==="detail"      && renderDetail()}
           {screen==="settings"    && renderSettings()}
+          {screen==="outcomes"    && renderOutcomes()}
           {screen==="about"       && renderAbout()}
         </main>
       </div>
