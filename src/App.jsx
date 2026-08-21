@@ -288,7 +288,7 @@ const TIERS = [
 ═══════════════════════════════════════════════ */
 const FLAG_TIER = {
   id:"flagged", label:"NOT AN IDEAL CANDIDATE",
-  verdict:"Surgical Risk Red Flag present — correct before flap reconstruction",
+  verdict:"Red flag present — reversible. Correct, then re-score.",
   headline:"Do not proceed with flap reconstruction until the flagged condition is addressed. These conditions are reversible — re-score once corrected.",
   timing:null,
   bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c",
@@ -1053,16 +1053,18 @@ export default function F2FApp(){
               {tier.verdict}
             </div>
 
-            {/* Primary recommendation — bold, high contrast */}
-            <div style={{background:"#fff",borderRadius:10,padding:"14px 16px",marginTop:4}}>
-              <div style={{fontSize:9,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:tier.accent,marginBottom:5}}>Recommendation</div>
-              <div style={{fontSize:15,fontWeight:600,color:"#111",lineHeight:1.45}}>{tier.headline}</div>
-              {tier.timing&&(
-                <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:12,color:tier.accent,fontWeight:600,letterSpacing:".04em"}}>
-                  ⏱ OPTIMIZATION WINDOW · {tier.timing}
-                </div>
-              )}
-            </div>
+            {/* Primary recommendation — shown only for numeric tiers, not when flag-gated */}
+            {!hasScoreFlags&&(
+              <div style={{background:"#fff",borderRadius:10,padding:"14px 16px",marginTop:4}}>
+                <div style={{fontSize:9,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:tier.accent,marginBottom:5}}>Recommendation</div>
+                <div style={{fontSize:15,fontWeight:600,color:"#111",lineHeight:1.45}}>{tier.headline}</div>
+                {tier.timing&&(
+                  <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:12,color:tier.accent,fontWeight:600,letterSpacing:".04em"}}>
+                    ⏱ OPTIMIZATION WINDOW · {tier.timing}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {!isQuick&&(
@@ -1073,7 +1075,7 @@ export default function F2FApp(){
 
           <div style={{marginBottom:20}}>
             <button className={`copy-btn ${copied?"copied":""}`} onClick={handleCopy}>
-              {copied?"✓ Copied to clipboard":"📋 Copy Results to Clipboard"}
+              {copied?"✓ Copied":"📋 Save Results to Clipboard"}
             </button>
             {copyFallback&&(
               <div>
@@ -1086,11 +1088,8 @@ export default function F2FApp(){
           {ciFlags.length>0&&(
             <div style={{marginBottom:24}}>
               <div style={{border:"1px solid var(--r)",borderRadius:10,overflow:"hidden"}}>
-                <div style={{background:"var(--r)",padding:"12px 16px"}}>
-                  <div style={{fontSize:11,fontWeight:800,letterSpacing:".08em",textTransform:"uppercase",color:"#fff"}}>⚑ Surgical Risk Red Flag — Correct Before Flap</div>
-                  <div style={{fontSize:12.5,color:"#fff",opacity:.95,marginTop:4,lineHeight:1.5}}>
-                    This patient is <strong>not an ideal candidate for flap reconstruction</strong> until the item(s) below are addressed. Each is reversible — re-score once corrected.
-                  </div>
+                <div style={{background:"var(--r)",padding:"11px 16px"}}>
+                  <div style={{fontSize:11,fontWeight:800,letterSpacing:".08em",textTransform:"uppercase",color:"#fff"}}>⚑ Correct Before Flap Reconstruction</div>
                 </div>
                 <div style={{padding:"4px 16px 16px"}}>
                   {ciFlags.map((c,i)=>{
