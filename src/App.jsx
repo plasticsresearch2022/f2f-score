@@ -174,7 +174,7 @@ const DOMAINS = [
       hint:"Chronic nutritional status marker — half-life 18–20 days",
       options:[
         {v:"a",label:"≥ 3.5",pts:0},{v:"b",label:"3.0 – 3.49",pts:1},{v:"c",label:"2.5 – 2.99",pts:3},
-        {v:"ci",label:"< 2.5",pts:0,isCI:true,ciLabel:"Red Flag"},
+        {v:"ci",label:"< 2.5",pts:3,isCI:true,ciLabel:"Red Flag",flagId:"albumin"},
       ]},
     { id:"prealbumin", type:"radio", label:"Prealbumin", unit:"mg/dL",
       hint:"Short-term nutritional response marker — half-life 2–3 days",
@@ -189,7 +189,7 @@ const DOMAINS = [
       hint:"Select 'Not ordered' for clean wounds without infection concern",
       options:[
         {v:"a",label:"< 0.5",pts:0},{v:"b",label:"0.5 – 2.0",pts:2},
-        {v:"ci",label:"> 2.0  or  clinical sepsis",pts:0,isCI:true,ciLabel:"Red Flag"},
+        {v:"ci",label:"> 2.0  or  clinical sepsis",pts:2,isCI:true,ciLabel:"Red Flag",flagId:"pct"},
         {v:"no",label:"Not ordered — clean wound / no infection concern",pts:0},
       ]},
     { id:"inflammation", type:"toggle", pts:2, label:"Elevated inflammatory markers",
@@ -253,7 +253,7 @@ const DOMAINS = [
       options:[
         {v:"a", label:"Reliable 24/7 care available",pts:0},
         {v:"b", label:"Some support — inconsistent",pts:2},
-        {v:"ci",label:"No support system available",pts:0,isCI:true,ciLabel:"Red Flag"},
+        {v:"ci",label:"No support system available",pts:2,isCI:true,ciLabel:"Red Flag",flagId:"support"},
       ]},
   ]},
 ];
@@ -281,6 +281,37 @@ const TIERS = [
     bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c"},
 ];
 
+/* ═══════════════════════════════════════════════
+   RED FLAG GATE — overrides the numeric tier.
+   Any in-domain red flag makes the patient Not an
+   Ideal Candidate until corrected, regardless of score.
+═══════════════════════════════════════════════ */
+const FLAG_TIER = {
+  id:"flagged", label:"NOT AN IDEAL CANDIDATE",
+  verdict:"Surgical Risk Red Flag present — correct before flap reconstruction",
+  headline:"Do not proceed with flap reconstruction until the flagged condition is addressed. These conditions are reversible — re-score once corrected.",
+  timing:null,
+  bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c",
+};
+
+const FLAG_ACTIONS = {
+  albumin: {
+    title:"Albumin < 2.5 g/dL — Severe Hypoalbuminemia",
+    kind:"Laboratory value",
+    text:"Confirm the laboratory value first — verify it is not a transient or erroneous result. Begin aggressive nutritional optimization (high-protein intake ≥ 1.5 g/kg/day, dietitian involvement, enteral support if needed). Note that albumin has an 18–20 day half-life and will not correct quickly — expect weeks, not days. Track response with prealbumin (2–3 day half-life). Re-score once albumin has meaningfully improved.",
+  },
+  pct: {
+    title:"PCT > 2.0 ng/mL or Clinical Sepsis",
+    kind:"Laboratory value / clinical",
+    text:"Confirm the result and treat the underlying infection or sepsis before any reconstruction. Obtain cultures and initiate organism-directed antibiotics. Perform serial wound debridements to optimize local infection control and reduce bioburden. NPWT or NPWTi-d may be used as an adjunct between debridements. Re-score once the infection is controlled and markers normalize.",
+  },
+  support: {
+    title:"No Support System Available",
+    kind:"Structural / social barrier",
+    text:"Reliable post-operative support is essential for flap survival and wound care adherence. Involve case management and social work early to build the full support plan the patient needs — caregiver arrangements, home health, placement, transportation, and follow-up logistics. This is a reversible barrier once a durable 24/7 support structure is secured. Re-score once support is confirmed in place.",
+  },
+};
+
 function computeScore(answers) {
   let total=0; const ciFlags=[]; const domainScores={};
   for (const domain of DOMAINS) {
@@ -290,7 +321,7 @@ function computeScore(answers) {
       if(f.type==="toggle"){ ds+=val===true?f.pts:0; }
       else{
         const opt=f.options?.find(o=>o.v===val);
-        if(opt){ if(opt.isCI) ciFlags.push({field:f.label,label:opt.ciLabel}); else ds+=opt.pts; }
+        if(opt){ if(opt.isCI){ ciFlags.push({field:f.label,label:opt.ciLabel,flagId:opt.flagId}); ds+=opt.pts; } else ds+=opt.pts; }
       }
     }
     // Cap each domain at its maximum — raw points above the cap do not carry over
@@ -492,7 +523,7 @@ function RadioField({field,value,onChange}){
           const s=value===opt.v,ci=opt.isCI,cls=s?(ci?"sel-ci":"sel"):"";
           return(<button key={opt.v} className={`opt ${cls}`} onClick={()=>onChange(field.id,opt.v)}>
             <span className={`opt-lbl ${cls}`}>{opt.label}</span>
-            <span className={`opt-pts ${cls}`}>{ci?opt.ciLabel:`+${opt.pts}`}</span>
+            <span className={`opt-pts ${cls}`}>{ci?`+${opt.pts} ⚑`:`+${opt.pts}`}</span>
           </button>);
         })}
       </div>
@@ -531,8 +562,8 @@ function RecCard({rec,index}){
 }
 
 function TierChip({tierId}){
-  const labels={low:"Low",moderate:"Moderate",high:"High",not_ideal:"Not Ideal"};
-  return <span className={`tier-chip ${tierId}`}>{labels[tierId]||tierId}</span>;
+  const labels={low:"Low",moderate:"Moderate",high:"High",not_ideal:"Not Ideal",flagged:"⚑ Red Flag"};
+  return <span className={`tier-chip ${tierId==="flagged"?"not_ideal":tierId}`}>{labels[tierId]||tierId}</span>;
 }
 
 /* ═══════════════════════════════════════════════
@@ -600,8 +631,10 @@ export default function F2FApp(){
   },[currentPage,answers]);
 
   const {total,ciFlags,domainScores}=useMemo(()=>computeScore(answers),[answers]);
-  const tier=getTier(total);
-  const recs=useMemo(()=>buildRecs(answers,tier.id),[answers,tier.id]);
+  const hasScoreFlags = ciFlags.length>0;
+  const tier = hasScoreFlags ? FLAG_TIER : getTier(total);
+  const numericTier = getTier(total);
+  const recs=useMemo(()=>buildRecs(answers,numericTier.id),[answers,numericTier.id]);
 
   // Progress: 5% for flags, 90% spread across all domain pages, 5% buffer
   const totalDomainPages = DOMAINS.reduce((sum,d)=>sum+getDomainPages(d).length,0);
@@ -643,6 +676,7 @@ export default function F2FApp(){
             assessmentType:assessType||"new",
             savedAt:new Date().toISOString(), answers:{...answers}, score:total,
             tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
+            flagged:hasScoreFlags, flagIds:ciFlags.map(c=>c.flagId),
           };
           persistCase(caseData);
           setCases(fetchAllCases());
@@ -1050,9 +1084,32 @@ export default function F2FApp(){
           </div>
 
           {ciFlags.length>0&&(
-            <div className="alert al-red" style={{marginBottom:20}}>
-              <div className="al-title" style={{color:"var(--r)"}}>Surgical Risk Red Flags — Identified During Scoring</div>
-              {ciFlags.map((c,i)=><div key={i} className="al-body" style={{color:"var(--r)",marginBottom:2}}>• {c.field} — {c.label}</div>)}
+            <div style={{marginBottom:24}}>
+              <div style={{border:"1px solid var(--r)",borderRadius:10,overflow:"hidden"}}>
+                <div style={{background:"var(--r)",padding:"12px 16px"}}>
+                  <div style={{fontSize:11,fontWeight:800,letterSpacing:".08em",textTransform:"uppercase",color:"#fff"}}>⚑ Surgical Risk Red Flag — Correct Before Flap</div>
+                  <div style={{fontSize:12.5,color:"#fff",opacity:.95,marginTop:4,lineHeight:1.5}}>
+                    This patient is <strong>not an ideal candidate for flap reconstruction</strong> until the item(s) below are addressed. Each is reversible — re-score once corrected.
+                  </div>
+                </div>
+                <div style={{padding:"4px 16px 16px"}}>
+                  {ciFlags.map((c,i)=>{
+                    const act=FLAG_ACTIONS[c.flagId];
+                    if(!act) return (
+                      <div key={i} style={{paddingTop:14}}>
+                        <div style={{fontSize:12.5,fontWeight:700,color:"var(--r)"}}>{c.field} — {c.label}</div>
+                      </div>
+                    );
+                    return(
+                      <div key={i} style={{paddingTop:14,borderTop:i>0?"1px solid #f0dede":"none",marginTop:i>0?14:0}}>
+                        <div style={{fontSize:13,fontWeight:700,color:"var(--r)",marginBottom:2}}>{act.title}</div>
+                        <div style={{fontSize:10,fontWeight:600,letterSpacing:".06em",textTransform:"uppercase",color:"#c88",marginBottom:6}}>{act.kind}</div>
+                        <div style={{fontSize:13,color:"var(--k2)",lineHeight:1.7}}>{act.text}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           )}
 
@@ -1216,7 +1273,7 @@ export default function F2FApp(){
 
   const renderDetail=()=>{
     if(!selCase) return null;
-    const t=TIERS.find(t=>t.id===selCase.tierId)||TIERS[0];
+    const t=(selCase.tierId==="flagged"?FLAG_TIER:TIERS.find(t=>t.id===selCase.tierId))||TIERS[0];
     const d=selCase.domainScores||{};
     const detailRecs=buildRecs(selCase.answers||{},selCase.tierId);
     return(
