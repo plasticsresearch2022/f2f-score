@@ -156,12 +156,11 @@ function buildFullCSV(cases, outcomes) {
 ═══════════════════════════════════════════════ */
 const RISK_FLAGS = [
   { id:"asa",        label:"Unstable ASA IV–V patient" },
-  { id:"sepsis",     label:"Uncontrolled sepsis (PCT > 2 ng/mL + clinical signs)" },
-  { id:"coag",       label:"Uncorrectable coagulopathy — INR > 2, platelets < 20,000, or DIC" },
+  { id:"sepsis",     label:"Severe sepsis (PCT > 2 ng/mL + clinical signs) or septic shock" },
+  { id:"coag",       label:"Severe coagulopathy — INR > 2, platelets < 20,000, or DIC" },
   { id:"mi",         label:"Recent MI or unstable cardiac event (< 3 months) without cardiac clearance" },
-  { id:"metabolic",  label:"Uncorrectable severe metabolic derangements — hyperkalemia, severe acidosis, renal failure without support" },
+  { id:"metabolic",  label:"Severe metabolic derangement — hyperkalemia, severe acidosis, renal failure without support" },
   { id:"wound_inf",  label:"Active uncontrolled wound infection — purulence, spreading cellulitis, or necrosis" },
-  { id:"pvd_abs",    label:"Severe PVD with no viable revascularization options (lower extremities)" },
   { id:"support",    label:"No realistic 24/7 support or ability to comply with post-operative regimen" },
   { id:"palliative", label:"Very limited life expectancy or palliative goals not aligned with major flap surgery" },
 ];
@@ -189,11 +188,11 @@ const DOMAINS = [
     { id:"pct", type:"radio", label:"Procalcitonin (PCT)", unit:"ng/mL",
       hint:"Select 'Not ordered' for clean wounds without infection concern",
       options:[
-        {v:"a",label:"< 0.5",pts:0},{v:"b",label:"0.5 – 2.0",pts:1},
+        {v:"a",label:"< 0.5",pts:0},{v:"b",label:"0.5 – 2.0",pts:2},
         {v:"ci",label:"> 2.0  or  clinical sepsis",pts:0,isCI:true,ciLabel:"Red Flag"},
         {v:"no",label:"Not ordered — clean wound / no infection concern",pts:0},
       ]},
-    { id:"inflammation", type:"toggle", pts:1, label:"Elevated inflammatory markers",
+    { id:"inflammation", type:"toggle", pts:2, label:"Elevated inflammatory markers",
       hint:"CRP > 100 mg/L  or  WBC ≥ 12,000/mm³ — without sepsis" },
   ]},
   { id:"wound", label:"Wound Factors", maxPts:9, fields:[
@@ -276,7 +275,7 @@ const TIERS = [
     timing:"2–4 weeks",
     bg:"#ffedd5", bar:"#ea580c", ink:"#7c2d12", accent:"#c2410c"},
   {id:"not_ideal",min:20, max:Infinity, label:"NOT AN IDEAL CANDIDATE",
-    verdict:"Not a surgical candidate at this time",
+    verdict:"Not an ideal candidate for flap reconstruction",
     headline:"Prioritize palliative and advanced wound care rather than major flap reconstruction.",
     timing:null,
     bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c"},
@@ -294,6 +293,8 @@ function computeScore(answers) {
         if(opt){ if(opt.isCI) ciFlags.push({field:f.label,label:opt.ciLabel}); else ds+=opt.pts; }
       }
     }
+    // Cap each domain at its maximum — raw points above the cap do not carry over
+    ds=Math.min(ds, domain.maxPts);
     domainScores[domain.id]=ds; total+=ds;
   }
   return {total,ciFlags,domainScores};
