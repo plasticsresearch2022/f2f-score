@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect } from "react";
+import { motion, AnimatePresence, animate, useReducedMotion } from "framer-motion";
 
 /* ═══════════════════════════════════════════════
    F2F Score — Vercel production build
@@ -508,6 +509,72 @@ input::placeholder,textarea::placeholder{color:#999 !important;-webkit-text-fill
 .settings-label{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--k4);margin-bottom:10px}
 .settings-input{width:100%;padding:11px 12px;border:1px solid var(--g2);font-family:var(--mono);font-size:12px;color:var(--k);background:var(--w);margin-bottom:8px;outline:none}
 .settings-input:focus{border-color:var(--k)}.settings-note{font-size:12px;color:var(--k4);line-height:1.6}
+
+/* On mobile the sheet is a transparent pass-through (padding lives on .main) */
+.sheet{width:100%}
+
+/* ═══════════════════════════════════════════════
+   RESPONSIVE — Desktop / Tablet web view
+   Full-width top bar + a white content card centered
+   in the viewport (vertically when short, scrolls when
+   tall) on a soft grey backdrop. Single column keeps
+   line length readable — correct UX for a clinical form.
+═══════════════════════════════════════════════ */
+@media (min-width:768px){
+  html,body{background:var(--g1)}
+  /* full-viewport shell — no floating card on .app */
+  .app{max-width:none;width:100%;min-height:100dvh;margin:0;border:none;box-shadow:none;background:var(--g1)}
+  /* full-width black top bar; its content capped + centered */
+  .hdr{position:sticky;top:0;padding:16px 32px}
+  .hdr-row{max-width:1080px;margin:0 auto;width:100%}
+  /* grey region that centers the white card */
+  .main{flex:1;display:flex;flex-direction:column;align-items:center;padding:32px 24px;background:var(--g1)}
+  /* the centered content card — margin:auto centers it vertically when short,
+     scrolls without clipping when tall */
+  .sheet{max-width:520px;margin:auto;background:var(--w);border:1px solid var(--g2);
+         box-shadow:0 1px 3px rgba(0,0,0,.06),0 10px 30px rgba(0,0,0,.05);padding:40px 44px}
+  .sheet-wide{max-width:680px}
+  /* size bumps */
+  .home-hero{padding:36px 0 30px}
+  .home-title{font-size:44px}
+  .home-sub{max-width:320px}
+  .display{font-size:34px}
+  .domain-title{font-size:32px}
+}
+@media (min-width:1024px){
+  .main{padding:40px 32px}
+  .sheet{max-width:540px;padding:44px 48px}
+  .sheet-wide{max-width:700px}
+}
+@media (min-width:1440px){
+  .main{padding:52px 32px}
+  .sheet{max-width:560px;padding:48px 52px}
+  .sheet-wide{max-width:760px}
+  .home-title{font-size:48px}
+  .display{font-size:36px}
+  .domain-title{font-size:34px}
+}
+
+/* ═══════════════════════════════════════════════
+   ACCESSIBILITY — focus visibility + reduced motion
+═══════════════════════════════════════════════ */
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--k);outline-offset:2px}
+.opt:focus-visible,.ci-row:focus-visible,.hosp-card:focus-visible,.confirm-check-row:focus-visible{outline:2px solid var(--k);outline-offset:1px}
+.copy-btn:focus-visible,.btn-p:focus-visible{outline:2px solid var(--w);outline-offset:-4px}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important;scroll-behavior:auto!important}
+}
+
+/* ── Tactile press feedback (instant for reduced-motion via rule above) ── */
+.btn-p,.btn-s,.home-btn-new,.home-btn-sec,.copy-btn,.opt,.ci-row,.hosp-card,.record-item,.tbtn,.export-btn,.confirm-check-row{transition:transform .1s ease,border-color .12s ease,background .12s ease,opacity .12s ease,box-shadow .12s ease}
+.btn-p:active,.home-btn-new:active{transform:scale(.985)}
+.btn-s:active,.home-btn-sec:active,.copy-btn:active,.opt:active,.ci-row:active,.hosp-card:active,.record-item:active,.tbtn:active,.export-btn:active,.confirm-check-row:active{transform:scale(.99)}
+
+/* ── One-question-at-a-time domain progress dots ── */
+.field-dots{display:flex;gap:6px;margin:14px 0 22px}
+.field-dot{width:6px;height:6px;border-radius:50%;background:var(--g3);transition:background .2s ease,transform .2s ease}
+.field-dot.done{background:var(--k3)}
+.field-dot.active{background:var(--k);transform:scale(1.35)}
 `;
 
 /* ═══════════════════════════════════════════════
@@ -547,18 +614,32 @@ function ToggleField({field,value,onChange}){
   );
 }
 
-function RecCard({rec,index}){
+function RecCard({rec,index,reduce}){
   const urgent=rec.p===1;
   return(
-    <div className="rec-item">
+    <motion.div className="rec-item"
+      initial={reduce?false:{opacity:0,y:10}}
+      animate={{opacity:1,y:0}}
+      transition={{duration:0.3,delay:Math.min(index*0.045,0.55),ease:[0.22,0.61,0.36,1]}}>
       <div className="rec-meta">
         <span className={`rec-index ${urgent?"urg":""}`}>{String(index+1).padStart(2,"0")}</span>
         {urgent&&<span className="rec-dot"/>}
         <span className={`rec-cat ${urgent?"urg":""}`}>{rec.cat}</span>
       </div>
       <div className="rec-body">{rec.text}</div>
-    </div>
+    </motion.div>
   );
+}
+
+/* Animated count-up for the score; respects reduced motion */
+function AnimatedNumber({value,reduce,duration=0.85}){
+  const [display,setDisplay]=useState(reduce?value:0);
+  useEffect(()=>{
+    if(reduce){ setDisplay(value); return; }
+    const controls=animate(0,value,{duration,ease:[0.16,1,0.3,1],onUpdate:v=>setDisplay(Math.round(v))});
+    return()=>controls.stop();
+  },[value,reduce,duration]);
+  return <>{display}</>;
 }
 
 function TierChip({tierId}){
@@ -601,6 +682,9 @@ export default function F2FApp(){
   const [fontLevel,     setFontLevel]     = useState(()=>{ try{return parseInt(localStorage.getItem("f2f_fontlevel"))||2;}catch(e){return 2;} });
   const FONT_SCALE = {1:0.9, 2:1.0, 3:1.15, 4:1.35};
   const setFont=(lvl)=>{ setFontLevel(lvl); try{localStorage.setItem("f2f_fontlevel",String(lvl));}catch(e){} };
+
+  // Honour the OS "reduce motion" setting everywhere we animate
+  const reduce = useReducedMotion();
 
   // Load persisted cases on mount
   useEffect(()=>{
@@ -993,26 +1077,42 @@ export default function F2FApp(){
       {wizStep>=2&&wizStep<=5&&domain&&currentPage&&(
         <div>
           <div className="domain-tag">Domain {wizStep-1} of 4 · {domain.label}</div>
-          <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:20}}>
+          <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:2}}>
             Question {fieldStep+1} of {domainPages.length}
           </div>
+          <div className="field-dots">
+            {domainPages.map((p,i)=>{
+              const done = p.type==="single"
+                ? answers[p.field.id]!==undefined
+                : p.fields.every(f=>answers[f.id]!==undefined);
+              return <span key={i} className={`field-dot ${i===fieldStep?"active":""} ${done?"done":""}`}/>;
+            })}
+          </div>
 
-          {currentPage.type==="single"&&(
-            <RadioField field={currentPage.field} value={answers[currentPage.field.id]} onChange={updateAnswer}/>
-          )}
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div key={`${wizStep}-${fieldStep}`}
+              initial={reduce?{opacity:0}:{opacity:0,x:26}}
+              animate={{opacity:1,x:0}}
+              exit={reduce?{opacity:0}:{opacity:0,x:-26}}
+              transition={{duration:reduce?0.12:0.3,ease:[0.22,0.61,0.36,1]}}>
+              {currentPage.type==="single"&&(
+                <RadioField field={currentPage.field} value={answers[currentPage.field.id]} onChange={updateAnswer}/>
+              )}
 
-          {currentPage.type==="toggles"&&(
-            <div>
-              <div className="domain-title" style={{marginBottom:16}}>{domain.label}</div>
-              {currentPage.fields.map(f=>(
-                <ToggleField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
-              ))}
-              <div style={{marginTop:12,padding:"10px 12px",background:"var(--g1)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <span style={{fontSize:11.5,color:"var(--k4)"}}>Domain score so far</span>
-                <span style={{fontFamily:"var(--mono)",fontSize:14,color:"var(--k)",fontWeight:500}}>{domainScores[domain.id]??0} / {domain.maxPts} pts</span>
-              </div>
-            </div>
-          )}
+              {currentPage.type==="toggles"&&(
+                <div>
+                  <div className="domain-title" style={{marginBottom:16}}>{domain.label}</div>
+                  {currentPage.fields.map(f=>(
+                    <ToggleField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
+                  ))}
+                  <div style={{marginTop:12,padding:"10px 12px",background:"var(--g1)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:11.5,color:"var(--k4)"}}>Domain score so far</span>
+                    <span style={{fontFamily:"var(--mono)",fontSize:14,color:"var(--k)",fontWeight:500}}>{domainScores[domain.id]??0} / {domain.maxPts} pts</span>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          </AnimatePresence>
 
           <div className="btn-row" style={{marginTop:24}}>
             <button className="btn-s" onClick={goPrevWiz}>← Back</button>
@@ -1036,22 +1136,26 @@ export default function F2FApp(){
           </div>
 
           {/* ══ VERDICT PANEL — dramatic, colored by tier ══ */}
-          <div style={{background:tier.bg,borderRadius:14,padding:"28px 22px 24px",marginBottom:20,textAlign:"center",border:`1px solid ${tier.bar}22`}}>
+          <motion.div style={{background:tier.bg,borderRadius:14,padding:"28px 22px 24px",marginBottom:20,textAlign:"center",border:`1px solid ${tier.bar}22`}}
+            initial={reduce?false:{opacity:0,scale:0.97}} animate={{opacity:1,scale:1}}
+            transition={{duration:0.45,ease:[0.22,0.61,0.36,1]}}>
             {/* Score number + denom */}
             <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,marginBottom:4}}>
-              <span style={{fontFamily:"var(--serif)",fontSize:72,fontStyle:"italic",lineHeight:1,letterSpacing:"-.04em",color:tier.ink}}>{total}</span>
+              <span style={{fontFamily:"var(--serif)",fontSize:72,fontStyle:"italic",lineHeight:1,letterSpacing:"-.04em",color:tier.ink}}><AnimatedNumber value={total} reduce={reduce}/></span>
               <span style={{fontFamily:"var(--mono)",fontSize:15,color:tier.accent}}>/ 30</span>
             </div>
 
             {/* Tier label — large and bold */}
-            <div style={{fontSize:38,fontWeight:800,lineHeight:1.05,letterSpacing:"-.02em",color:tier.ink,marginTop:12,marginBottom:6}}>
+            <motion.div style={{fontSize:38,fontWeight:800,lineHeight:1.05,letterSpacing:"-.02em",color:tier.ink,marginTop:12,marginBottom:6}}
+              initial={reduce?false:{opacity:0,y:6}} animate={{opacity:1,y:0}} transition={{delay:0.55,duration:0.4}}>
               {tier.label}
-            </div>
+            </motion.div>
 
             {/* Plain-language verdict — states good or not */}
-            <div style={{fontSize:16,fontWeight:700,color:tier.accent,marginBottom:14,lineHeight:1.3}}>
+            <motion.div style={{fontSize:16,fontWeight:700,color:tier.accent,marginBottom:14,lineHeight:1.3}}
+              initial={reduce?false:{opacity:0,y:6}} animate={{opacity:1,y:0}} transition={{delay:0.65,duration:0.4}}>
               {tier.verdict}
-            </div>
+            </motion.div>
 
             {/* Primary recommendation — shown only for numeric tiers, not when flag-gated */}
             {!hasScoreFlags&&(
@@ -1065,7 +1169,7 @@ export default function F2FApp(){
                 )}
               </div>
             )}
-          </div>
+          </motion.div>
 
           {!isQuick&&(
             <div className="alert al-green" style={{marginBottom:16}}>
@@ -1120,7 +1224,9 @@ export default function F2FApp(){
                 <div className="b-row" key={d.id}>
                   <span className="b-name">{d.label}</span>
                   <div className="b-right">
-                    <div className="b-bar-wrap"><div className="b-bar-fill" style={{width:`${Math.min((ds/d.maxPts)*100,100)}%`}}/></div>
+                    <div className="b-bar-wrap"><motion.div className="b-bar-fill"
+                      initial={reduce?false:{width:0}} animate={{width:`${Math.min((ds/d.maxPts)*100,100)}%`}}
+                      transition={{duration:0.6,delay:0.2,ease:"easeOut"}}/></div>
                     <span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{d.maxPts}</span></span>
                   </div>
                 </div>
@@ -1149,10 +1255,12 @@ export default function F2FApp(){
                         Urgent — Act Immediately
                       </div>
                       {urgent.map((r,i)=>(
-                        <div key={i} style={{border:"1px solid var(--r)",borderLeft:"3px solid var(--r)",borderRadius:8,padding:"14px 16px",marginBottom:8,background:"#fff8f8"}}>
+                        <motion.div key={i} style={{border:"1px solid var(--r)",borderLeft:"3px solid var(--r)",borderRadius:8,padding:"14px 16px",marginBottom:8,background:"#fff8f8"}}
+                          initial={reduce?false:{opacity:0,y:10}} animate={{opacity:1,y:0}}
+                          transition={{duration:0.3,delay:Math.min(0.2+i*0.06,0.6),ease:[0.22,0.61,0.36,1]}}>
                           <div style={{fontSize:12.5,fontWeight:700,color:"var(--r)",marginBottom:6,lineHeight:1.3}}>{r.cat}</div>
                           <div style={{fontSize:13,color:"var(--k2)",lineHeight:1.7}}>{r.text}</div>
-                        </div>
+                        </motion.div>
                       ))}
                     </div>
                   )}
@@ -1297,13 +1405,13 @@ export default function F2FApp(){
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
           {DOMAINS.map(dom=>{
             const ds=d[dom.id]??0;
-            return(<div className="b-row" key={dom.id}><span className="b-name">{dom.label}</span><div className="b-right"><div className="b-bar-wrap"><div className="b-bar-fill" style={{width:`${Math.min((ds/dom.maxPts)*100,100)}%`}}/></div><span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{dom.maxPts}</span></span></div></div>);
+            return(<div className="b-row" key={dom.id}><span className="b-name">{dom.label}</span><div className="b-right"><div className="b-bar-wrap"><motion.div className="b-bar-fill" initial={reduce?false:{width:0}} animate={{width:`${Math.min((ds/dom.maxPts)*100,100)}%`}} transition={{duration:0.6,delay:0.15,ease:"easeOut"}}/></div><span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{dom.maxPts}</span></span></div></div>);
           })}
           <div className="b-total" style={{marginTop:12}}><span className="b-total-lbl">Total F2F Score</span><span className="b-total-pts">{selCase.score} pts</span></div>
         </div>
         <div style={{marginBottom:24}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:16}}>Patient-Specific Action Plan</div>
-          {detailRecs.map((r,i)=><RecCard key={i} rec={r} index={i}/>)}
+          {detailRecs.map((r,i)=><RecCard key={i} rec={r} index={i} reduce={reduce}/>)}
         </div>
       </div>
     );
@@ -1522,15 +1630,26 @@ export default function F2FApp(){
           )}
         </header>
         <main className="main" style={{zoom:FONT_SCALE[fontLevel]}}>
-          {screen==="home"        && renderHome()}
-          {screen==="intake"      && renderIntake()}
-          {screen==="id_confirm"  && renderIdConfirm()}
-          {screen==="wizard"      && renderWizard()}
-          {screen==="records"     && renderRecords()}
-          {screen==="detail"      && renderDetail()}
-          {screen==="settings"    && renderSettings()}
-          {screen==="outcomes"    && renderOutcomes()}
-          {screen==="about"       && renderAbout()}
+          {/* .sheet is a pass-through on mobile; ≥768px it becomes the centered white card */}
+          <div className={`sheet ${screen==="records"?"sheet-wide":""}`}>
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div key={screen}
+                initial={reduce?{opacity:0}:{opacity:0,y:8}}
+                animate={{opacity:1,y:0}}
+                exit={reduce?{opacity:0}:{opacity:0,y:-8}}
+                transition={{duration:reduce?0.12:0.24,ease:[0.22,0.61,0.36,1]}}>
+                {screen==="home"        && renderHome()}
+                {screen==="intake"      && renderIntake()}
+                {screen==="id_confirm"  && renderIdConfirm()}
+                {screen==="wizard"      && renderWizard()}
+                {screen==="records"     && renderRecords()}
+                {screen==="detail"      && renderDetail()}
+                {screen==="settings"    && renderSettings()}
+                {screen==="outcomes"    && renderOutcomes()}
+                {screen==="about"       && renderAbout()}
+              </motion.div>
+            </AnimatePresence>
+          </div>
         </main>
       </div>
     </>
