@@ -35,6 +35,8 @@ function rowToCase(row) {
     enteredBy:      row.entered_by_name,
     serviceId:      row.service_id,
     supersedesId:   row.supersedes_id,
+    source:         row.source,
+    engineVersion:  row.engine_version,
     voidedAt:       row.voided_at,
     voidReason:     row.void_reason,
   };
@@ -54,6 +56,7 @@ function rowToOutcome(row) {
     enteredBy:    row.entered_by_name,
     serviceId:    row.service_id,
     supersedesId: row.supersedes_id,
+    source:       row.source,
     voidedAt:     row.voided_at,
     voidReason:   row.void_reason,
   };
@@ -78,6 +81,7 @@ function caseToRow(record, ctx) {
     flagged:              Boolean(record.flagged),
     flag_ids:             record.flagIds || [],
     supersedes_id:        record.supersedesId || null,
+    engine_version:       record.engineVersion || undefined,
   };
 }
 

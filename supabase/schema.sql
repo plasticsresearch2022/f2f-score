@@ -91,6 +91,17 @@ alter table public.assessments add column if not exists flagged              boo
 alter table public.assessments add column if not exists flag_ids             jsonb;
 alter table public.assessments add column if not exists supersedes_id        uuid references public.assessments on delete set null;
 alter table public.assessments add column if not exists void_reason          text;
+-- 'app' = scored in-app and therefore reconcilable against computeScore.
+-- 'import' = carried over from the research spreadsheet, which recorded
+-- totals but not the per-question answers, so the integrity check must
+-- skip score reconciliation for these or it reports false tampering.
+alter table public.assessments add column if not exists source               text not null default 'app';
+-- Which revision of the scoring engine produced this score. Point values
+-- and scoring rules change upstream, so a score is only meaningful next to
+-- the engine that produced it — and only reconcilable against that engine.
+-- Rows scored before v1.1 used different rules and must not be silently
+-- mixed with current ones in analysis.
+alter table public.assessments add column if not exists engine_version       text not null default '1.1';
 alter table public.assessments add column if not exists voided_at            timestamptz;
 alter table public.assessments add column if not exists voided_by            uuid references auth.users on delete set null;
 
@@ -121,6 +132,8 @@ create table if not exists public.outcomes (
   voided_by            uuid references auth.users on delete set null,
   recorded_at          timestamptz not null default now()
 );
+
+alter table public.outcomes add column if not exists source text not null default 'app';
 
 create index if not exists outcomes_service_idx on public.outcomes (service_id, recorded_at desc);
 create index if not exists outcomes_study_idx   on public.outcomes (study_id);

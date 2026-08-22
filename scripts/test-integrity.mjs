@@ -30,6 +30,7 @@ const clean = (over = {}) => ({
   remoteId: "r1", studyId: "LCH-001", assessmentType: "new",
   answers: {}, domainScores: { bio: 0, wound: 0, comorbidities: 0, functional: 0 },
   score: 0, tierId: "low", enrollmentDate: ymd(Date.now()), savedAt: iso(Date.now()),
+  source: "app", engineVersion: "1.1",
   serviceId: "s1", enteredBy: "R. Patel", ...over,
 });
 
@@ -42,7 +43,7 @@ try {
     define: { "import.meta.env": JSON.stringify({}) },
     loader: { ".jsx": "jsx" }, logLevel: "silent",
   });
-  const { findIssues, buildAdminCSV } = await import(pathToFileURL(out).href);
+  const { findIssues, buildAdminCSV, ENGINE_VERSION } = await import(pathToFileURL(out).href);
 
   /* ── A clean dataset must be silent ── */
   {
@@ -94,6 +95,28 @@ try {
     const issues = findIssues([], [{ studyId: "LCH-999", serviceId: "s1", outcomes: {}, enteredBy: "J. Lee" }]);
     check("flags an outcome with no assessment", issues.some(i => /Outcome with no assessment/.test(i.title)),
       issues.map(i => i.title).join("; "));
+  }
+
+  /* ── Exemptions: reconciling these would compare against the wrong engine ── */
+  {
+    // Imported rows have no per-question answers, only a total.
+    const issues = findIssues([clean({ source: "import", score: 14, engineVersion: "pre-1.1" })], []);
+    check("imported rows are not reported as tampered",
+      !issues.some(i => /Score does not match/.test(i.title)), issues.map(i => i.title).join("; "));
+  }
+  {
+    // Scored under older point values — different, not wrong.
+    const issues = findIssues([clean({ score: 14, engineVersion: "pre-1.1" })], []);
+    check("old-engine rows are not reported as tampered",
+      !issues.some(i => /Score does not match/.test(i.title)), issues.map(i => i.title).join("; "));
+    check("old-engine rows are surfaced as a version warning",
+      issues.some(i => /scored on engine pre-1\.1/.test(i.title)), issues.map(i => i.title).join("; "));
+  }
+  {
+    // The exemption must not become a blanket amnesty for current rows.
+    const issues = findIssues([clean({ score: 14, engineVersion: ENGINE_VERSION })], []);
+    check("current-engine rows are still reconciled",
+      issues.some(i => /Score does not match/.test(i.title)), issues.map(i => i.title).join("; "));
   }
 
   /* ── Voided rows drop out of analysis ── */

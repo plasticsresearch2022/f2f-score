@@ -210,6 +210,14 @@ function downloadCSV(text, name) {
 ═══════════════════════════════════════════════ */
 const THIRTY_DAYS = 30*24*60*60*1000;
 
+/* Bump whenever upstream changes point values or scoring rules. Stored on
+   every assessment, because a score only means something alongside the
+   engine that produced it. Between the June build and v1.1, three rules
+   changed: the inflammation toggle went 1→2 pts, red-flag options began
+   contributing their points instead of only raising a flag, and domains
+   became capped at maxPts. */
+export const ENGINE_VERSION = "1.1";
+
 export function findIssues(cases, outcomes) {
   const issues = [];
   const live = cases.filter(c=>!c.voidedAt);
@@ -217,8 +225,20 @@ export function findIssues(cases, outcomes) {
 
   /* Recomputing the score from the stored answers is the real tamper check:
      computeScore is deterministic, so a mismatch means the row did not come
-     from this app's scoring path. */
+     from this app's scoring path.
+
+     Two exemptions, both because reconciliation would be comparing against
+     the wrong thing and would drown the real signal in false alarms:
+       - imported rows, where the spreadsheet recorded totals but never the
+         per-question answers
+       - rows scored by an earlier engine, whose point values differed */
+  const staleEngine = new Map();
   for(const c of live){
+    if(c.source==="import") continue;
+    if(c.engineVersion && c.engineVersion!==ENGINE_VERSION){
+      staleEngine.set(c.engineVersion, (staleEngine.get(c.engineVersion)||0)+1);
+      continue;
+    }
     const { total, domainScores } = computeScore(c.answers||{});
     if(typeof c.score==="number" && total!==c.score){
       issues.push({ sev:"bad", studyId:c.studyId, id:c.remoteId,
@@ -235,6 +255,15 @@ export function findIssues(cases, outcomes) {
         break;
       }
     }
+  }
+
+  /* Scores from a superseded engine are not wrong, but they are not
+     comparable with current ones — a real problem for a prospective study,
+     and one only an admin can decide how to resolve. */
+  for(const [ver,n] of staleEngine){
+    issues.push({ sev:"warn", studyId:"—", id:null,
+      title:`${n} assessment${n===1?"":"s"} scored on engine ${ver}, not ${ENGINE_VERSION}`,
+      body:`Point values changed between these versions, so these scores are not directly comparable with ones scored since. Re-score them from their saved answers, or analyse them as a separate cohort — but do not pool them silently.` });
   }
 
   // Same study scored twice with the same assessment type — likely double entry.
@@ -1088,7 +1117,7 @@ export default function F2FApp(){
           const caseData={
             studyId, hospital:hospital.name, hospitalId:hospital.id, enrollmentDate:enrollDate,
             assessmentType:assessType||"new",
-            savedAt:new Date().toISOString(), answers:{...answers}, score:total,
+            savedAt:new Date().toISOString(),engineVersion:ENGINE_VERSION, answers:{...answers}, score:total,
             tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
             flagged:hasScoreFlags, flagIds:ciFlags.map(c=>c.flagId),
           };
