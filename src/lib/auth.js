@@ -62,12 +62,13 @@ export async function redeemServiceCode(code, memberName) {
     p_member_name: memberName ? String(memberName).trim() : null,
   });
 
-  if (error) {
-    // 28P01 is the invalid-code path the RPC raises. Anything else is real.
-    if (error.code === "28P01" || /invalid access code/i.test(error.message || "")) {
-      throw new Error("That access code was not recognised. Check with your service lead.");
-    }
-    throw friendlyAuthError(error);
+  if (error) throw friendlyAuthError(error);
+
+  /* A wrong code comes back as a normal response with ok:false, not an
+     exception — the RPC has to commit its audit row, and raising would roll
+     that back. */
+  if (!data || data.ok === false) {
+    throw new Error("That access code was not recognised. Check with your service lead.");
   }
 
   if (data?.member?.display_name) setDeviceIdentity(data.member);

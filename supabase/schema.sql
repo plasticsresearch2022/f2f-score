@@ -18,7 +18,7 @@
 --   Dashboard → Authentication → Sign In / Providers → Anonymous
 -- ═══════════════════════════════════════════════
 
-create extension if not exists pgcrypto;
+create extension if not exists pgcrypto with schema extensions;
 
 -- ═══════════════════════════════════════════════
 -- 1. SERVICES + ROSTER
@@ -173,15 +173,22 @@ $$;
 -- 7. CURRENT VIEWS
 -- A row is "current" when it is not voided and nothing supersedes it.
 -- Computed, never stored — which is what keeps the tables append-only.
+--
+-- security_invoker = true is LOAD-BEARING, not a nicety. A view runs as
+-- its owner by default, and the owner here is postgres — so without this
+-- these views would bypass RLS completely and hand every collector the
+-- whole study. Never drop this setting.
 -- ═══════════════════════════════════════════════
-create or replace view public.assessments_current as
+drop view if exists public.assessments_current;
+create view public.assessments_current with (security_invoker = true) as
   select a.* from public.assessments a
    where a.voided_at is null
      and not exists (
        select 1 from public.assessments b
         where b.supersedes_id = a.id and b.voided_at is null);
 
-create or replace view public.outcomes_current as
+drop view if exists public.outcomes_current;
+create view public.outcomes_current with (security_invoker = true) as
   select o.* from public.outcomes o
    where o.voided_at is null
      and not exists (
@@ -249,7 +256,10 @@ create trigger on_outcome_insert
 -- Redeem a service access code. Called right after anonymous sign-in.
 -- Returns the service + roster so the client can show "who are you?".
 create or replace function public.redeem_service_code(p_code text, p_member_name text default null)
-returns jsonb language plpgsql security definer set search_path = public as $$
+returns jsonb language plpgsql security definer
+  -- pgcrypto lives in `extensions` on Supabase, not public; crypt() is
+  -- invisible to this function without it on the search_path.
+  set search_path = public, extensions as $$
 declare
   v_service public.services%rowtype;
   v_member  public.service_members%rowtype;
@@ -266,10 +276,12 @@ begin
    limit 1;
 
   if not found then
-    -- Log the miss so an admin can spot code-guessing in the audit view.
+    -- Return a failure rather than RAISE: an exception would roll back this
+    -- very insert, and then code-guessing would leave no trace at all — which
+    -- defeats the point of logging it.
     insert into public.audit_log (actor_user_id, action, detail)
     values (auth.uid(), 'redeem_failed', jsonb_build_object('len', length(coalesce(p_code, ''))));
-    raise exception 'invalid access code' using errcode = '28P01';
+    return jsonb_build_object('ok', false, 'error', 'invalid_code');
   end if;
 
   -- Optional roster entry. Codes work without a name; the name is what
@@ -292,6 +304,7 @@ begin
           jsonb_build_object('service', v_service.slug));
 
   return jsonb_build_object(
+    'ok', true,
     'service', jsonb_build_object('id', v_service.id, 'name', v_service.name, 'slug', v_service.slug,
                                   'hospital_id', v_service.hospital_id, 'hospital_name', v_service.hospital_name),
     'member',  case when v_member.id is null then null
@@ -347,7 +360,7 @@ end; $$;
 create or replace function public.create_service(
   p_name text, p_slug text, p_code text,
   p_hospital_id text default null, p_hospital_name text default null)
-returns uuid language plpgsql security definer set search_path = public as $$
+returns uuid language plpgsql security definer set search_path = public, extensions as $$
 declare v_id uuid;
 begin
   if not public.is_admin() then
