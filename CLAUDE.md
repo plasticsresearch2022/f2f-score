@@ -21,38 +21,67 @@ Author of the clinical model: Pedro Fuenmayor, MD (Larkin Community Hospital, Mi
 | Frontend | Single-file React — `src/App.jsx` (UI + state + CSS-in-template-string) |
 | Build | Vite 5 + `@vitejs/plugin-react` |
 | Animation | **Framer Motion** (v12) |
-| Hosting | Vercel — scope `heliosxloupes-projects` |
-| Persistence (current) | `localStorage` (`f2f_*` keys) + optional Make.com webhook (Study ID → OneDrive) |
-| Backend (planned) | **Supabase** — Postgres + Auth + Row-Level Security |
-| Auth (planned) | **Google SSO** for clinicians; multi-user, per-clinician saved assessments |
+| Backend | **Supabase** — Postgres + Auth + Row-Level Security |
+| Auth | **Service access codes** over anonymous sign-in for collectors; email+password (or Google) for admins |
+| Persistence | Postgres is the source of truth. `localStorage` (`f2f_*` keys) is an offline cache and outbox — see `src/lib/sync.js` |
+| Hosting | Vercel — team `yeai`, auto-deploys on push |
 
 ## Source & Access
 
-- GitHub: `plasticsresearch2022/f2f-score` (**private**). Requires the **`yashaefimenko-ai`** GitHub account (NOT `heliosxloupes`). Use `gh auth switch` + `gh repo clone` (plain `git clone` uses the wrong cached token).
+- **Our repo (canonical):** `yashaefimenko-ai/f2f-score`. Work happens here.
+- **Upstream:** `plasticsresearch2022/f2f-score` (Pedro's, **private**, read-only to us). Requires the **`yashaefimenko-ai`** GitHub account, NOT `heliosxloupes`. Get a token without switching accounts: `gh auth token -u yashaefimenko-ai`.
 - Local: `c:\Users\IVIso\OneDrive\Desktop\Cursor\HeliosX\f2f-score`
-- Deploy: `vercel deploy --prod --yes --scope heliosxloupes-projects`
-- Live: https://f2f-score-beige.vercel.app
+- Live: https://f2f-score-yeai.vercel.app
+
+**Read `UPSTREAM.md` before touching `src/App.jsx`.** The clinical engine is
+copied verbatim from Pedro and is guarded by a parity check. We never push to
+his repo.
 
 ---
 
 ## Architecture
 
-`src/App.jsx` is a **deliberately centralized app shell** (~1100 lines): scoring engine, all screens, and the CSS string. Do **not** propose a full rewrite or split it apart without a real reason.
+`src/App.jsx` is a **deliberately centralized app shell**: scoring engine, all screens, and the CSS string. Do **not** propose a full rewrite or split it apart without a real reason. Backend concerns live in `src/lib/` precisely so the App.jsx diff against upstream stays small.
 
-### Scoring engine — the crown jewel (DO NOT ALTER without explicit instruction)
-- `DOMAINS` — 4 clinical domains (Biomarkers & Nutrition, Wound Factors, Comorbidities, Functional & Social), each field with point values
+| File | Role |
+|---|---|
+| `src/App.jsx` | Clinical engine (Pedro's, verbatim) + all screens + CSS |
+| `src/lib/supabase.js` | Client (PKCE, persisted sessions) |
+| `src/lib/auth.js` | Service-code redemption, roster, admin sign-in, session context |
+| `src/lib/db.js` | Insert-only writes, `*_current` reads, admin reads, void RPCs |
+| `src/lib/sync.js` | Offline-first cache + outbox; the seam Pedro's storage calls hook into |
+| `supabase/schema.sql` | Tables, RLS, RPCs, audit triggers. Idempotent. |
+
+### Scoring engine — the crown jewel (NEVER edit — it is upstream's)
+- `DOMAINS` — 4 clinical domains, each field with point values, each capped at `maxPts`
 - `TIERS` — Low (0–5) / Moderate (6–12) / High (13–19) / Not Ideal (20+)
+- `FLAG_TIER` / `FLAG_ACTIONS` — an in-domain red flag overrides the numeric tier
 - `RISK_FLAGS` — pre-screen surgical red flags
-- `computeScore()`, `getTier()`, `buildRecs()` — scoring + patient-specific action plan generation
+- `OUTCOME_FIELDS` / `CD_OPTIONS` — 30-day endpoints, derived Clavien-Dindo
+- `computeScore()`, `getTier()`, `buildRecs()`, `buildFullCSV()`, `buildCopyText()`
 
-Any change to point values, thresholds, or recommendation logic is a **clinical change** — confirm before touching.
+A change to point values, thresholds, or recommendation logic is a **clinical
+decision, not an engineering one** — it happens upstream first, then we re-sync.
+`npm run verify:clinical` fails if any of these drift.
 
 ### Screens
-home · intake (assessment type → hospital → study ID) · id_confirm (de-ID log) · wizard (red-flag pre-screen → 4 domains → result) · records · detail · settings · about
+home · intake · id_confirm · wizard · records · detail · outcomes · settings · about · **admin** (role-gated monitoring)
+
+### Access model
+- **Collectors** — anonymous Supabase session + a service access code, then a name from the roster. One step, once per device. Every row carries `service_id` and `entered_by_name`.
+- **Admins** — email+password; `profiles.role='admin'` unlocks cross-service reads and the void RPCs.
 
 ### Data & privacy
 - **De-identified by design**: Study IDs like `LCH-001`, never patient names/MRNs. The de-identification log lives outside the app.
 - Keep it de-identified. Do not add PHI fields. Preserve the clinical disclaimer.
+- **Append-only.** There is no UPDATE or DELETE policy on `assessments` or `outcomes`. Corrections insert a row with `supersedes_id`; voiding is an admin RPC that requires a reason. Never add a policy that would let a row be rewritten.
+
+### Verification
+```bash
+npm run check   # clinical parity + render (both modes) + integrity tests + build
+```
+Run it before every deploy. `npm run test:integrity` covers the tamper detection
+that the admin dashboard's credibility rests on.
 
 ---
 
@@ -87,12 +116,14 @@ Use available skills/plugins/MCP when they materially improve speed, correctness
 
 ## Conventions
 
-1. **Never silently change scoring/clinical logic.** Confirm clinical changes.
+1. **Never change the clinical engine.** It is Pedro's. Re-sync from upstream instead — see `UPSTREAM.md`.
 2. Preserve **de-identification** and the clinical disclaimer.
-3. Keep the **single-file** structure unless there's a real reason to split.
-4. Use **design tokens**, match existing spacing/motion/hierarchy.
-5. **Sanity-check builds** (`npm run build`) before deploying.
-6. Deploy to Vercel after meaningful changes (user's workflow).
+3. **Never make the data tables mutable.** Append-only is a research-integrity property, not a preference.
+4. Keep backend work in `src/lib/`. Every line added to `App.jsx` widens the diff we have to re-reconcile on Pedro's next upload.
+5. Keep the **single-file** structure for the UI unless there's a real reason to split.
+6. Use **design tokens**, match existing spacing/motion/hierarchy.
+7. **Run `npm run check`** before deploying — not just `npm run build`.
+8. Optimise for the resident at the bedside on a phone with bad wifi. Friction is why data ends up in a spreadsheet instead of the database.
 
 ## Communication Style
 
