@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "verify:clinical": "node scripts/verify-clinical-parity.mjs",
     "smoke": "node scripts/smoke-render.mjs",
-    "check": "npm run verify:clinical && npm run smoke && npm run build"
+    "test:integrity": "node scripts/test-integrity.mjs",
+    "check": "npm run verify:clinical && npm run smoke && npm run test:integrity && npm run build"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",

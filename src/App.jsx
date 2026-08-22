@@ -5,6 +5,7 @@ import {
   fetchContext, fetchRoster, onAuthChange, deviceIdentity, setDeviceIdentity,
 } from "./lib/auth";
 import * as sync from "./lib/sync";
+import * as adminDb from "./lib/db";
 
 /* ═══════════════════════════════════════════════
    F2F Score — Vercel production build
@@ -158,6 +159,127 @@ function buildFullCSV(cases, outcomes) {
       o?o.clavienDindo:"",o?o.notes:"",o?o.recordedAt:""];
   });
   return [H,...rows].map(r=>r.map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",")).join("\n");
+}
+
+/* ═══════════════════════════════════════════════
+   ADMIN EXPORT
+
+   Wraps Pedro's buildFullCSV rather than reimplementing it, so the
+   first 40 columns stay byte-compatible with the sheet the study
+   already uses. Provenance columns are appended after them.
+
+   Notes are the one free-text field, so newlines are flattened
+   before the wrapped call — a literal newline inside a quoted cell
+   would break the line-wise append below (and most spreadsheet
+   importers along with it).
+═══════════════════════════════════════════════ */
+const ADMIN_EXTRA_COLS = ["Service","Hospital ID","Entered By","Record ID","Status","Void Reason"];
+
+export function buildAdminCSV(cases, outcomes, serviceNames={}) {
+  const flat = (outcomes||[]).map(o=>({ ...o, notes:String(o.notes||"").replace(/[\r\n]+/g," · ") }));
+  const q = v => `"${String(v??"").replace(/"/g,'""')}"`;
+  const supersededIds = new Set(cases.map(c=>c.supersedesId).filter(Boolean));
+
+  const lines = buildFullCSV(cases, flat).split("\n");
+  return lines.map((line,i)=>{
+    if(i===0) return line + "," + ADMIN_EXTRA_COLS.map(q).join(",");
+    const c = cases[i-1];
+    if(!c) return line;
+    const status = c.voidedAt ? "VOIDED"
+                 : supersededIds.has(c.remoteId) ? "SUPERSEDED"
+                 : c.supersedesId ? "CORRECTION" : "";
+    return line + "," + [
+      serviceNames[c.serviceId] || "", c.hospitalId || "", c.enteredBy || "",
+      c.remoteId || "", status, c.voidReason || "",
+    ].map(q).join(",");
+  }).join("\n");
+}
+
+function downloadCSV(text, name) {
+  const a = document.createElement("a");
+  a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(text);
+  a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+/* ═══════════════════════════════════════════════
+   DATA INTEGRITY
+
+   What an admin actually needs to see is not "all the rows" but
+   "the rows something is wrong with". Ordered worst-first.
+═══════════════════════════════════════════════ */
+const THIRTY_DAYS = 30*24*60*60*1000;
+
+export function findIssues(cases, outcomes) {
+  const issues = [];
+  const live = cases.filter(c=>!c.voidedAt);
+  const outByStudy = new Map(outcomes.filter(o=>!o.voidedAt).map(o=>[o.studyId,o]));
+
+  /* Recomputing the score from the stored answers is the real tamper check:
+     computeScore is deterministic, so a mismatch means the row did not come
+     from this app's scoring path. */
+  for(const c of live){
+    const { total, domainScores } = computeScore(c.answers||{});
+    if(typeof c.score==="number" && total!==c.score){
+      issues.push({ sev:"bad", studyId:c.studyId, id:c.remoteId,
+        title:`Score does not match the answers — ${c.studyId}`,
+        body:`Stored score is ${c.score}, but recomputing from the saved answers gives ${total}. This row did not come from the normal scoring path. Entered by ${c.enteredBy||"unknown"}.` });
+      continue;
+    }
+    for(const d of DOMAINS){
+      const stored=(c.domainScores||{})[d.id];
+      if(typeof stored==="number" && stored!==domainScores[d.id]){
+        issues.push({ sev:"bad", studyId:c.studyId, id:c.remoteId,
+          title:`Domain total inconsistent — ${c.studyId}`,
+          body:`${d.label}: stored ${stored}, recomputed ${domainScores[d.id]}.` });
+        break;
+      }
+    }
+  }
+
+  // Same study scored twice with the same assessment type — likely double entry.
+  const byKey = new Map();
+  for(const c of live){
+    const k = `${c.studyId}::${c.assessmentType||"new"}`;
+    byKey.set(k, (byKey.get(k)||[]).concat(c));
+  }
+  for(const [k,rows] of byKey){
+    if(rows.length>1 && !rows.some(r=>r.supersedesId)){
+      const [studyId,type]=k.split("::");
+      issues.push({ sev:"warn", studyId, id:rows[0].remoteId,
+        title:`Duplicate ${type} assessment — ${studyId}`,
+        body:`${rows.length} separate ${type} assessments exist for this Study ID, none marked as a correction. Entered by ${[...new Set(rows.map(r=>r.enteredBy||"unknown"))].join(", ")}.` });
+    }
+  }
+
+  // Enrolled over 30 days ago with no outcome — the primary endpoint is missing.
+  const now = Date.now();
+  const seen = new Set();
+  for(const c of live){
+    if(seen.has(c.studyId)) continue;
+    seen.add(c.studyId);
+    if(outByStudy.has(c.studyId)) continue;
+    const when = new Date(c.enrollmentDate||c.savedAt).getTime();
+    if(!Number.isNaN(when) && now-when > THIRTY_DAYS){
+      const days=Math.floor((now-when)/(24*60*60*1000));
+      issues.push({ sev:"warn", studyId:c.studyId, id:c.remoteId,
+        title:`No 30-day outcome — ${c.studyId}`,
+        body:`Enrolled ${days} days ago with no outcome recorded. The primary endpoint is missing for this patient.` });
+    }
+  }
+
+  // An outcome with no assessment behind it — orphaned endpoint.
+  const studyIds = new Set(live.map(c=>c.studyId));
+  for(const o of outByStudy.values()){
+    if(!studyIds.has(o.studyId)){
+      issues.push({ sev:"warn", studyId:o.studyId, id:o.remoteId,
+        title:`Outcome with no assessment — ${o.studyId}`,
+        body:`A 30-day outcome exists for this Study ID but no pre-operative assessment does. Recorded by ${o.enteredBy||"unknown"}.` });
+    }
+  }
+
+  const rank={bad:0,warn:1};
+  return issues.sort((a,b)=>rank[a.sev]-rank[b.sev]);
 }
 
 /* ═══════════════════════════════════════════════
@@ -615,6 +737,43 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .sync-banner{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#fefce8;border-left:2px solid #ca8a04;font-size:12px;color:#713f12;margin-bottom:16px;line-height:1.5}
 .sync-banner.offline{background:var(--g1);border-color:var(--g3);color:var(--k3)}
 
+/* ═══════════════════════════════════════════════
+   ADMIN — monitoring across every service
+═══════════════════════════════════════════════ */
+.adm-tabs{display:flex;gap:4px;border-bottom:1px solid var(--g2);margin-bottom:18px;overflow-x:auto}
+.adm-tab{background:none;border:none;border-bottom:2px solid transparent;font-family:var(--sans);font-size:12.5px;font-weight:600;color:var(--k4);padding:9px 12px;cursor:pointer;white-space:nowrap}
+.adm-tab.on{color:var(--k);border-bottom-color:var(--k)}
+.adm-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(88px,1fr));gap:8px;margin-bottom:20px}
+.adm-stat{border:1px solid var(--g2);padding:11px 12px}
+.adm-stat-n{font-family:var(--serif);font-style:italic;font-size:26px;line-height:1;color:var(--k)}
+.adm-stat-n.warn{color:#b45309}.adm-stat-n.bad{color:var(--r)}
+.adm-stat-l{font-size:10px;color:var(--k4);margin-top:5px;line-height:1.35;letter-spacing:.02em}
+.adm-filters{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.adm-chip{font-size:11.5px;font-family:var(--sans);font-weight:500;padding:5px 11px;border:1px solid var(--g2);background:var(--w);color:var(--k3);cursor:pointer;border-radius:14px}
+.adm-chip.on{background:var(--k);border-color:var(--k);color:var(--w)}
+.adm-search{width:100%;padding:10px 12px;border:1px solid var(--g2);font-family:var(--mono);font-size:12px;color:var(--k);background:var(--w);outline:none;margin-bottom:12px}
+.adm-search:focus{border-color:var(--k)}
+.adm-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px}
+.adm-table{width:100%;border-collapse:collapse;font-size:12px;min-width:620px}
+.adm-table th{text-align:left;font-size:9.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--k4);padding:7px 9px;border-bottom:1px solid var(--g2);white-space:nowrap}
+.adm-table td{padding:9px;border-bottom:1px solid var(--g1);vertical-align:top}
+.adm-table tbody tr:hover{background:var(--g1)}
+.adm-table tr.voided td{opacity:.45;text-decoration:line-through}
+.adm-mono{font-family:var(--mono);font-size:11.5px}
+.adm-flagpill{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 6px;border-radius:2px;background:#fee2e2;color:#991b1b;margin-left:5px}
+.adm-flagpill.warn{background:#fef9c3;color:#854d0e}
+.adm-flagpill.info{background:var(--g1);color:var(--k3)}
+.adm-void{background:none;border:1px solid var(--g2);color:var(--k4);font-family:var(--sans);font-size:10.5px;font-weight:600;padding:3px 8px;cursor:pointer;white-space:nowrap}
+.adm-void:hover{border-color:var(--r);color:var(--r)}
+.adm-issue{border-left:2px solid #ca8a04;background:#fefce8;padding:11px 13px;margin-bottom:7px}
+.adm-issue.bad{border-color:var(--r);background:#fff8f8}
+.adm-issue-t{font-size:12px;font-weight:700;color:var(--k);margin-bottom:3px}
+.adm-issue-b{font-size:11.5px;color:var(--k3);line-height:1.55}
+.adm-audit{display:flex;gap:10px;padding:9px 0;border-bottom:1px solid var(--g1);font-size:11.5px}
+.adm-audit-when{font-family:var(--mono);font-size:10.5px;color:var(--k4);flex-shrink:0;width:96px}
+.adm-audit-what{color:var(--k2);line-height:1.5}
+.adm-audit-who{color:var(--k4)}
+
 /* ── Boot splash ── */
 .boot{min-height:100dvh;display:flex;align-items:center;justify-content:center;background:var(--w)}
 .boot-mark{font-family:var(--serif);font-style:italic;font-size:40px;color:var(--g3);animation:bootpulse 1.2s ease-in-out infinite}
@@ -813,6 +972,44 @@ export default function F2FApp(){
     finally{ setGateBusy(false); }
   }
 
+  /* ── Admin monitoring ─────────────────────────── */
+  const [admTab,     setAdmTab]     = useState("entries");   // entries | issues | audit
+  const [admCases,   setAdmCases]   = useState([]);
+  const [admOut,     setAdmOut]     = useState([]);
+  const [admAudit,   setAdmAudit]   = useState([]);
+  const [admServices,setAdmServices]= useState([]);
+  const [admSvcId,   setAdmSvcId]   = useState("all");
+  const [admQuery,   setAdmQuery]   = useState("");
+  const [admBusy,    setAdmBusy]    = useState(false);
+  const [admErr,     setAdmErr]     = useState("");
+
+  const loadAdmin=useCallback(async()=>{
+    if(!ctx?.isAdmin) return;
+    setAdmBusy(true); setAdmErr("");
+    try{
+      const [c,o,s,a]=await Promise.all([
+        adminDb.fetchAllAssessmentsAdmin(), adminDb.fetchAllOutcomesAdmin(),
+        adminDb.fetchServices(), adminDb.fetchAuditLog(300),
+      ]);
+      setAdmCases(c); setAdmOut(o); setAdmServices(s); setAdmAudit(a);
+    }catch(e){ setAdmErr(e.message||"Could not load monitoring data"); }
+    finally{ setAdmBusy(false); }
+  },[ctx]);
+
+  useEffect(()=>{ if(screen==="admin") loadAdmin(); },[screen,loadAdmin]);
+
+  async function handleVoid(kind,id,studyId){
+    const reason=window.prompt(
+      `Void ${kind} for ${studyId}?\n\nThis does not delete anything — the row stays in the record, marked void with your reason and name. Give a reason:`);
+    if(reason===null) return;
+    if(!reason.trim()){ setAdmErr("A reason is required to void a record."); return; }
+    try{
+      if(kind==="assessment") await adminDb.voidAssessment(id,reason);
+      else                    await adminDb.voidOutcome(id,reason);
+      await loadAdmin();
+    }catch(e){ setAdmErr(e.message||"Void failed"); }
+  }
+
   async function handleSignOut(){
     await signOut();
     sync.clearLocalCache();   // shared device — leave nothing behind
@@ -1000,6 +1197,12 @@ export default function F2FApp(){
         <button className="home-btn-sec" style={{borderStyle:"dashed"}} onClick={startQuickScore}>
           Quick Score — not saved
         </button>
+        {ctx?.isAdmin&&(
+          <button className="home-btn-sec" style={{borderColor:"var(--k)",fontWeight:700}}
+            onClick={()=>setScreen("admin")}>
+            Monitoring — all services
+          </button>
+        )}
       </div>
       <div className="alert al-dark" style={{marginBottom:20}}>
         <div className="al-title" style={{color:"var(--k)"}}>Clinical Disclaimer</div>
@@ -1747,6 +1950,141 @@ export default function F2FApp(){
   const showProg=screen==="wizard"&&wizStep<6;
 
   /* ═══════════════════════════════════════════════
+     ADMIN — cross-service monitoring
+  ═══════════════════════════════════════════════ */
+  const renderAdmin=()=>{
+    const svcName=Object.fromEntries(admServices.map(s=>[s.id,s.name]));
+    const inScope=r=>admSvcId==="all"||r.serviceId===admSvcId;
+    const q=admQuery.trim().toLowerCase();
+    const matches=r=>!q||[r.studyId,r.enteredBy,svcName[r.serviceId],r.hospital]
+      .some(v=>String(v||"").toLowerCase().includes(q));
+
+    const scoped     = admCases.filter(inScope);
+    const scopedOut  = admOut.filter(inScope);
+    const visible    = scoped.filter(matches);
+    const live       = scoped.filter(c=>!c.voidedAt);
+    const issues     = findIssues(scoped,scopedOut);
+    const supersededIds=new Set(scoped.map(c=>c.supersedesId).filter(Boolean));
+    const patients   = new Set(live.map(c=>c.studyId));
+    const withOutcome= new Set(scopedOut.filter(o=>!o.voidedAt).map(o=>o.studyId));
+    const voided     = scoped.filter(c=>c.voidedAt).length;
+
+    return(
+      <div>
+        <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
+        <div className="eyebrow">Research oversight</div>
+        <div className="display" style={{fontSize:24,marginBottom:4}}>Monitoring</div>
+        <div className="caption" style={{marginBottom:16}}>
+          Every entry across every service. Nothing here can be deleted — only voided, with a reason and your name attached.
+        </div>
+
+        {admErr&&<div className="alert al-red" style={{marginBottom:14}}><div className="al-body" style={{color:"var(--r)"}}>{admErr}</div></div>}
+
+        <div className="adm-stats">
+          <div className="adm-stat"><div className="adm-stat-n">{patients.size}</div><div className="adm-stat-l">Patients enrolled</div></div>
+          <div className="adm-stat"><div className="adm-stat-n">{live.length}</div><div className="adm-stat-l">Assessments</div></div>
+          <div className="adm-stat"><div className="adm-stat-n">{withOutcome.size}</div><div className="adm-stat-l">30-day outcomes</div></div>
+          <div className="adm-stat"><div className={`adm-stat-n ${issues.some(i=>i.sev==="bad")?"bad":issues.length?"warn":""}`}>{issues.length}</div><div className="adm-stat-l">Issues to review</div></div>
+          <div className="adm-stat"><div className="adm-stat-n">{voided}</div><div className="adm-stat-l">Voided</div></div>
+        </div>
+
+        <div className="adm-filters">
+          <button className={`adm-chip ${admSvcId==="all"?"on":""}`} onClick={()=>setAdmSvcId("all")}>All services</button>
+          {admServices.map(s=>(
+            <button key={s.id} className={`adm-chip ${admSvcId===s.id?"on":""}`} onClick={()=>setAdmSvcId(s.id)}>{s.name}</button>
+          ))}
+        </div>
+
+        <div className="adm-tabs">
+          {[["entries",`Entries (${visible.length})`],["issues",`Issues (${issues.length})`],["audit","Audit trail"]].map(([id,lbl])=>(
+            <button key={id} className={`adm-tab ${admTab===id?"on":""}`} onClick={()=>setAdmTab(id)}>{lbl}</button>
+          ))}
+        </div>
+
+        {admBusy&&<div className="caption" style={{padding:"20px 0"}}>Loading…</div>}
+
+        {!admBusy&&admTab==="entries"&&(
+          <>
+            <input className="adm-search" value={admQuery} placeholder="Filter by Study ID, person, or hospital…"
+              onChange={e=>setAdmQuery(e.target.value)}/>
+            <button className="btn-s" style={{width:"100%",marginBottom:14}}
+              disabled={scoped.length===0}
+              onClick={()=>downloadCSV(buildAdminCSV(scoped,scopedOut,svcName),
+                `F2F_Research_Export_${new Date().toISOString().split("T")[0]}.csv`)}>
+              Export {scoped.length} record{scoped.length!==1?"s":""} (CSV)
+            </button>
+            {visible.length===0
+              ? <div className="empty-state"><div className="empty-text">Nothing matches</div></div>
+              : (
+                <div className="adm-scroll">
+                  <table className="adm-table">
+                    <thead><tr>
+                      <th>Study ID</th><th>Type</th><th>Score</th><th>Service</th>
+                      <th>Entered by</th><th>Date</th><th>Outcome</th><th/>
+                    </tr></thead>
+                    <tbody>
+                      {visible.map(c=>{
+                        const hasOut=withOutcome.has(c.studyId);
+                        const sup=supersededIds.has(c.remoteId);
+                        return(
+                          <tr key={c.remoteId} className={c.voidedAt?"voided":""}>
+                            <td className="adm-mono">{c.studyId}</td>
+                            <td>{({new:"New",reassessment:"Re-assess",preop:"Pre-op"})[c.assessmentType]||"New"}
+                              {sup&&<span className="adm-flagpill info">superseded</span>}
+                              {c.supersedesId&&<span className="adm-flagpill info">correction</span>}
+                              {c.voidedAt&&<span className="adm-flagpill">void</span>}
+                            </td>
+                            <td className="adm-mono">{c.score}{c.flagged&&<span className="adm-flagpill">⚑</span>}</td>
+                            <td>{svcName[c.serviceId]||"—"}</td>
+                            <td>{c.enteredBy||"—"}</td>
+                            <td className="adm-mono">{(c.enrollmentDate||c.savedAt||"").slice(0,10)}</td>
+                            <td>{hasOut?<span style={{color:"#15803d",fontWeight:700}}>✓</span>:<span style={{color:"var(--k4)"}}>—</span>}</td>
+                            <td>{!c.voidedAt&&<button className="adm-void" onClick={()=>handleVoid("assessment",c.remoteId,c.studyId)}>Void</button>}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+          </>
+        )}
+
+        {!admBusy&&admTab==="issues"&&(
+          issues.length===0
+            ? <div className="empty-state"><div className="empty-icon">✓</div><div className="empty-text">No issues found</div>
+                <div className="empty-sub">Scores reconcile, no duplicates, no missing endpoints.</div></div>
+            : issues.map((it,i)=>(
+                <div key={i} className={`adm-issue ${it.sev==="bad"?"bad":""}`}>
+                  <div className="adm-issue-t">{it.title}</div>
+                  <div className="adm-issue-b">{it.body}</div>
+                </div>
+              ))
+        )}
+
+        {!admBusy&&admTab==="audit"&&(
+          admAudit.length===0
+            ? <div className="empty-state"><div className="empty-text">No activity yet</div></div>
+            : admAudit.filter(a=>admSvcId==="all"||a.service_id===admSvcId).map(a=>(
+                <div key={a.id} className="adm-audit">
+                  <div className="adm-audit-when">{new Date(a.at).toLocaleString(undefined,{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</div>
+                  <div className="adm-audit-what">
+                    <strong>{a.action.replace(/_/g," ")}</strong>
+                    {a.study_id&&<> · <span className="adm-mono">{a.study_id}</span></>}
+                    <div className="adm-audit-who">
+                      {a.actor_name||"unknown"}
+                      {a.action==="redeem_failed"&&<span className="adm-flagpill warn">bad code</span>}
+                      {a.detail?.reason&&<> — “{a.detail.reason}”</>}
+                    </div>
+                  </div>
+                </div>
+              ))
+        )}
+      </div>
+    );
+  };
+
+  /* ═══════════════════════════════════════════════
      ACCESS GATE
      One code, then one name. No email, no password, no reset
      loop — those are what keep residents out of the database
@@ -1947,6 +2285,7 @@ export default function F2FApp(){
                 {screen==="settings"    && renderSettings()}
                 {screen==="outcomes"    && renderOutcomes()}
                 {screen==="about"       && renderAbout()}
+                {screen==="admin"       && renderAdmin()}
               </motion.div>
             </AnimatePresence>
           </div>
