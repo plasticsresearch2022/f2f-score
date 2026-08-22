@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useCallback } from "react";
 import { motion, AnimatePresence, animate, useReducedMotion } from "framer-motion";
 import {
   isSupabaseConfigured, redeemServiceCode, signInAdmin, signOut,
-  fetchContext, fetchRoster, onAuthChange, deviceIdentity, setDeviceIdentity,
+  fetchContext, fetchRoster, onAuthChange, deviceIdentity, setDeviceIdentity, signInWithGoogle,
 } from "./lib/auth";
 import * as sync from "./lib/sync";
 import * as adminDb from "./lib/db";
@@ -744,6 +744,11 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .gate-foot{margin-top:26px;text-align:center}
 .gate-link{background:none;border:none;color:var(--k3);font-family:var(--sans);font-size:12.5px;font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:4px;padding:8px}
 .gate-link:hover{color:var(--k)}
+.google-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:9px;padding:13px 20px;background:var(--w);color:var(--k);border:1px solid var(--g2);font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer}
+.google-btn:hover:not(:disabled){background:var(--g1)}
+.google-btn:disabled{opacity:.5;cursor:not-allowed}
+.auth-divider{display:flex;align-items:center;gap:10px;margin:16px 0;font-size:10.5px;color:var(--k4);letter-spacing:.1em;text-transform:uppercase}
+.auth-divider::before,.auth-divider::after{content:"";flex:1;height:1px;background:var(--g2)}
 .gate-note{font-size:11px;color:var(--g3);line-height:1.7;margin-top:18px;text-align:center}
 .gate-service{font-size:13px;color:var(--k3);text-align:center;margin-bottom:20px}
 .gate-service strong{color:var(--k);font-weight:700}
@@ -992,6 +997,12 @@ export default function F2FApp(){
       setGateCode("");
     }catch(e){ setGateErr(e.message); }
     finally{ setGateBusy(false); }
+  }
+
+  async function handleGoogle(){
+    setGateErr(""); setGateBusy(true);
+    try{ await signInWithGoogle(); }        // navigates away; no need to unset busy
+    catch(e){ setGateErr(e.message); setGateBusy(false); }
   }
 
   async function handleAdminSignIn(){
@@ -2208,6 +2219,19 @@ export default function F2FApp(){
 
           {gateStep==="admin"&&(
             <div>
+              {/* Every existing account was created through Google and has no
+                  password, so this has to come first — an email/password-only
+                  screen would lock every current admin out. */}
+              <button className="google-btn" disabled={gateBusy} onClick={handleGoogle}>
+                <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">
+                  <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-2.8-.4-4H24v7.3h12.1c-.2 2-1.6 5-4.5 7l-.1.3 6.5 5 .5.1c4.1-3.8 6.6-9.4 6.6-15.7"/>
+                  <path fill="#34A853" d="M24 46c5.9 0 10.9-1.9 14.5-5.3l-6.9-5.4c-1.8 1.3-4.3 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.1l-.3v.1l-6.7 5.2-.1.3C8 41.1 15.4 46 24 46"/>
+                  <path fill="#FBBC05" d="M11.5 28.4c-.5-1.4-.8-2.9-.8-4.4s.3-3 .7-4.4v-.3l-6.8-5.3-.2.1C2.9 17 2 20.4 2 24s.9 7 2.4 10.1z"/>
+                  <path fill="#EB4335" d="M24 10.7c4.1 0 6.9 1.8 8.5 3.3l6.2-6C34.9 4.5 29.9 2 24 2 15.4 2 8 6.9 4.4 13.9l7 5.5c1.8-5.3 6.8-8.7 12.6-8.7"/>
+                </svg>
+                Continue with Google
+              </button>
+              <div className="auth-divider">or</div>
               <div className="gate-label">Email</div>
               <input className="gate-input plain" type="email" value={gateEmail} autoFocus
                 autoCapitalize="off" autoCorrect="off" spellCheck={false}
