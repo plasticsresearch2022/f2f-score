@@ -1,5 +1,10 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { motion, AnimatePresence, animate, useReducedMotion } from "framer-motion";
+import {
+  isSupabaseConfigured, redeemServiceCode, signInAdmin, signOut,
+  fetchContext, fetchRoster, onAuthChange, deviceIdentity, setDeviceIdentity,
+} from "./lib/auth";
+import * as sync from "./lib/sync";
 
 /* ═══════════════════════════════════════════════
    F2F Score — Vercel production build
@@ -24,13 +29,16 @@ function lsKeys(p){ try{return Object.keys(localStorage).filter(k=>k.startsWith(
 function persistCase(data){
   const key=`f2f_case_${data.studyId}_${Date.now()}`;
   lsSet(key,JSON.stringify(data));
+  sync.enqueue("case", key);   // ← local write is the commit; the cloud catches up
 }
 function fetchAllCases(){
   return lsKeys("f2f_case_").map(k=>{try{return JSON.parse(lsGet(k));}catch(e){return null;}})
     .filter(Boolean).sort((a,b)=>new Date(b.savedAt)-new Date(a.savedAt));
 }
 function persistOutcome(studyId, data){
-  lsSet(`f2f_outcome_${studyId}`, JSON.stringify(data));
+  const key=`f2f_outcome_${studyId}`;
+  lsSet(key, JSON.stringify(data));
+  sync.enqueue("outcome", key);
 }
 function fetchOutcome(studyId){
   const r=lsGet(`f2f_outcome_${studyId}`);
@@ -570,6 +578,48 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .btn-p:active,.home-btn-new:active{transform:scale(.985)}
 .btn-s:active,.home-btn-sec:active,.copy-btn:active,.opt:active,.ci-row:active,.hosp-card:active,.record-item:active,.tbtn:active,.export-btn:active,.confirm-check-row:active{transform:scale(.99)}
 
+/* ═══════════════════════════════════════════════
+   ACCESS SCREEN — service code + roster
+═══════════════════════════════════════════════ */
+.gate{min-height:100dvh;display:flex;flex-direction:column;justify-content:center;padding:32px 24px;max-width:460px;margin:0 auto}
+.gate-hero{text-align:center;margin-bottom:34px}
+.gate-brand{font-family:var(--serif);font-style:italic;font-size:42px;letter-spacing:-.03em;color:var(--k);line-height:1.05}
+.gate-tagline{font-size:12.5px;color:var(--k4);margin-top:8px;line-height:1.6}
+.gate-label{font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--k4);margin-bottom:8px}
+.gate-input{width:100%;padding:15px 16px;border:1.5px solid var(--g2);font-family:var(--mono);font-size:16px;letter-spacing:.08em;color:var(--k);background:var(--w);outline:none;text-transform:uppercase}
+.gate-input:focus{border-color:var(--k)}
+.gate-input.plain{font-family:var(--sans);letter-spacing:normal;text-transform:none}
+.gate-err{font-size:12.5px;color:var(--r);margin-top:10px;line-height:1.5}
+.gate-foot{margin-top:26px;text-align:center}
+.gate-link{background:none;border:none;color:var(--k3);font-family:var(--sans);font-size:12.5px;font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:4px;padding:8px}
+.gate-link:hover{color:var(--k)}
+.gate-note{font-size:11px;color:var(--g3);line-height:1.7;margin-top:18px;text-align:center}
+.gate-service{font-size:13px;color:var(--k3);text-align:center;margin-bottom:20px}
+.gate-service strong{color:var(--k);font-weight:700}
+.roster-btn{display:flex;align-items:center;gap:11px;width:100%;text-align:left;padding:13px 14px;border:1px solid var(--g2);background:var(--w);cursor:pointer;font-family:var(--sans);margin-bottom:6px}
+.roster-btn.sel{border-color:var(--k);background:var(--g1)}
+.roster-radio{width:16px;height:16px;border:1.5px solid var(--g3);border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.roster-btn.sel .roster-radio{border-color:var(--k)}
+.roster-dot{width:8px;height:8px;background:var(--k);border-radius:50%}
+.roster-name{font-size:13.5px;font-weight:500;color:var(--k)}
+.roster-role{font-family:var(--mono);font-size:10px;color:var(--k4);margin-top:1px;text-transform:uppercase;letter-spacing:.06em}
+
+/* ── Header account + sync chips ── */
+.hdr-acct{display:flex;align-items:center;gap:7px;background:none;border:1px solid #333;color:#bbb;font-family:var(--sans);font-size:10.5px;font-weight:600;padding:4px 9px;border-radius:4px;cursor:pointer;max-width:150px}
+.hdr-acct:hover{border-color:#666;color:#fff}
+.hdr-acct-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sync-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sync-dot.ok{background:#16a34a}
+.sync-dot.pending{background:#ca8a04}
+.sync-dot.off{background:#666}
+.sync-banner{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#fefce8;border-left:2px solid #ca8a04;font-size:12px;color:#713f12;margin-bottom:16px;line-height:1.5}
+.sync-banner.offline{background:var(--g1);border-color:var(--g3);color:var(--k3)}
+
+/* ── Boot splash ── */
+.boot{min-height:100dvh;display:flex;align-items:center;justify-content:center;background:var(--w)}
+.boot-mark{font-family:var(--serif);font-style:italic;font-size:40px;color:var(--g3);animation:bootpulse 1.2s ease-in-out infinite}
+@keyframes bootpulse{0%,100%{opacity:.4}50%{opacity:.9}}
+
 /* ── One-question-at-a-time domain progress dots ── */
 .field-dots{display:flex;gap:6px;margin:14px 0 22px}
 .field-dot{width:6px;height:6px;border-radius:50%;background:var(--g3);transition:background .2s ease,transform .2s ease}
@@ -685,6 +735,89 @@ export default function F2FApp(){
 
   // Honour the OS "reduce motion" setting everywhere we animate
   const reduce = useReducedMotion();
+
+  /* ── Access: service code → roster → app ──────────────
+     Collectors never see an email field. One code, one name,
+     once per device. Admins take the separate door below. */
+  const [authReady,  setAuthReady]  = useState(!isSupabaseConfigured);
+  const [ctx,        setCtx]        = useState(null);
+  const [gateStep,   setGateStep]   = useState("code");   // code | roster | admin
+  const [gateCode,   setGateCode]   = useState("");
+  const [gateName,   setGateName]   = useState(()=>deviceIdentity()?.display_name || "");
+  const [gateEmail,  setGateEmail]  = useState("");
+  const [gatePass,   setGatePass]   = useState("");
+  const [gateErr,    setGateErr]    = useState("");
+  const [gateBusy,   setGateBusy]   = useState(false);
+  const [roster,     setRoster]     = useState([]);
+  const [pendingSvc, setPendingSvc] = useState(null);
+  const [syncState,  setSyncState]  = useState(sync.status());
+
+  const refreshCtx = useCallback(async()=>{
+    try{ setCtx(await fetchContext()); }
+    catch(e){ console.warn("[F2F] context load failed:",e?.message); setCtx(null); }
+  },[]);
+
+  // Resolve the session once on boot, then follow it.
+  useEffect(()=>{
+    if(!isSupabaseConfigured) return;
+    let alive=true;
+    const finish=()=>{ if(alive) setAuthReady(true); };
+    refreshCtx().finally(finish);
+    // Never let a hung network leave the user staring at the splash.
+    const bail=setTimeout(finish,2500);
+    const unsub=onAuthChange(()=>{ refreshCtx().finally(finish); });
+    return()=>{ alive=false; clearTimeout(bail); unsub(); };
+  },[refreshCtx]);
+
+  // Point the sync layer at the current identity whenever it changes.
+  useEffect(()=>{
+    if(!isSupabaseConfigured) return;
+    sync.start(ctx).then(()=>setCases(fetchAllCases())).catch(()=>{});
+    return()=>sync.stop();
+  },[ctx]);
+
+  useEffect(()=>sync.onSyncChange(setSyncState),[]);
+
+  const signedIn  = !isSupabaseConfigured || Boolean(ctx?.canCollect) || Boolean(ctx?.isAdmin);
+  const whoAmI    = ctx?.displayName || deviceIdentity()?.display_name || "";
+  const serviceNm = ctx?.service?.name || "";
+
+  async function handleRedeem(){
+    setGateErr(""); setGateBusy(true);
+    try{
+      const res=await redeemServiceCode(gateCode, null);
+      setPendingSvc(res.service);
+      setRoster(res.roster||[]);
+      setGateStep("roster");
+    }catch(e){ setGateErr(e.message); }
+    finally{ setGateBusy(false); }
+  }
+
+  async function handleJoin(name){
+    const chosen=(name||gateName||"").trim();
+    if(chosen.length<2){ setGateErr("Enter your name so entries can be traced back to you."); return; }
+    setGateErr(""); setGateBusy(true);
+    try{
+      await redeemServiceCode(gateCode, chosen);
+      setDeviceIdentity({display_name:chosen});
+      await refreshCtx();
+      setGateCode("");
+    }catch(e){ setGateErr(e.message); }
+    finally{ setGateBusy(false); }
+  }
+
+  async function handleAdminSignIn(){
+    setGateErr(""); setGateBusy(true);
+    try{ await signInAdmin(gateEmail,gatePass); await refreshCtx(); setGatePass(""); }
+    catch(e){ setGateErr(e.message); }
+    finally{ setGateBusy(false); }
+  }
+
+  async function handleSignOut(){
+    await signOut();
+    sync.clearLocalCache();   // shared device — leave nothing behind
+    setCtx(null); setCases([]); setGateStep("code"); setGateName(""); setScreen("home");
+  }
 
   // Load persisted cases on mount
   useEffect(()=>{
@@ -1529,10 +1662,34 @@ export default function F2FApp(){
       <div className="eyebrow">Configuration</div>
       <div className="display" style={{marginBottom:4,fontSize:24}}>Settings</div>
       <div className="rule"/>
+      {isSupabaseConfigured&&ctx&&(
+        <>
+          <div style={{marginBottom:24}}>
+            <div className="settings-label">Signed in</div>
+            <div className="settings-note" style={{marginBottom:12}}>
+              <strong style={{color:"var(--k)"}}>{whoAmI||"Unnamed"}</strong>
+              {serviceNm&&<><br/>{serviceNm}</>}
+              {ctx.service?.hospital_name&&<><br/>{ctx.service.hospital_name}</>}
+              {ctx.isAdmin&&<><br/><span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--r)",fontWeight:700}}>ADMINISTRATOR</span></>}
+            </div>
+            <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:12}}>
+              {!syncState.online
+                ? "OFFLINE — entries are saved on this device and will upload automatically"
+                : syncState.pending>0
+                  ? `SYNCING — ${syncState.pending} entr${syncState.pending===1?"y":"ies"} waiting to upload`
+                  : syncState.cloud ? "SYNCED — all entries are saved to the research database"
+                                    : "LOCAL ONLY — not connected to the research database"}
+            </div>
+            <button className="btn-s" style={{width:"100%"}} onClick={handleSignOut}>Sign out</button>
+          </div>
+          <div className="rule"/>
+        </>
+      )}
       <div style={{marginBottom:24}}>
         <div className="settings-label">Research Data</div>
         <div className="settings-note" style={{marginBottom:12}}>
-          All scored assessments and 30-day outcomes are stored locally on this device. Export the full dataset as a CSV to merge into your master research spreadsheet.
+          Assessments and 30-day outcomes save automatically to the research database.
+          Export a CSV here if you need a local copy or a snapshot for analysis.
         </div>
         <button className="btn-p" onClick={exportAllCSV} disabled={cases.length===0}>
           Export All Data (CSV)
@@ -1589,6 +1746,134 @@ export default function F2FApp(){
 
   const showProg=screen==="wizard"&&wizStep<6;
 
+  /* ═══════════════════════════════════════════════
+     ACCESS GATE
+     One code, then one name. No email, no password, no reset
+     loop — those are what keep residents out of the database
+     and in a spreadsheet.
+  ═══════════════════════════════════════════════ */
+  const fade=(d=0)=>({
+    initial:reduce?false:{opacity:0,y:10}, animate:{opacity:1,y:0},
+    transition:{duration:0.4,delay:d,ease:[0.22,0.61,0.36,1]},
+  });
+
+  const renderGate=()=>(
+    <div className="gate">
+      <motion.div className="gate-hero" {...fade(0)}>
+        <div className="gate-brand">Fitness-to-Flap</div>
+        <div className="gate-tagline">
+          Pre-operative risk stratification<br/>Pressure Injury Module · v1.1
+        </div>
+      </motion.div>
+
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div key={gateStep}
+          initial={reduce?{opacity:0}:{opacity:0,x:20}}
+          animate={{opacity:1,x:0}}
+          exit={reduce?{opacity:0}:{opacity:0,x:-20}}
+          transition={{duration:reduce?0.12:0.28,ease:[0.22,0.61,0.36,1]}}>
+
+          {gateStep==="code"&&(
+            <div>
+              <div className="gate-label">Service access code</div>
+              <input className="gate-input" value={gateCode} autoFocus
+                autoCapitalize="characters" autoCorrect="off" spellCheck={false}
+                placeholder="CASTRELLON-26"
+                onChange={e=>{setGateCode(e.target.value);setGateErr("");}}
+                onKeyDown={e=>{if(e.key==="Enter"&&gateCode.trim())handleRedeem();}}/>
+              {gateErr&&<div className="gate-err">{gateErr}</div>}
+              <button className="btn-p" style={{marginTop:14}}
+                disabled={gateBusy||!gateCode.trim()} onClick={handleRedeem}>
+                {gateBusy?"Checking…":"Continue →"}
+              </button>
+              <div className="gate-foot">
+                <button className="gate-link" onClick={()=>{setGateStep("admin");setGateErr("");}}>
+                  Attending / admin login →
+                </button>
+              </div>
+              <div className="gate-note">
+                Your service lead has the code for this rotation.<br/>
+                You only need to do this once on this device.
+              </div>
+            </div>
+          )}
+
+          {gateStep==="roster"&&(
+            <div>
+              <div className="gate-service">
+                <strong>{pendingSvc?.name}</strong>
+                {pendingSvc?.hospital_name&&<><br/>{pendingSvc.hospital_name}</>}
+              </div>
+              <div className="gate-label">Who are you?</div>
+              {roster.map(m=>(
+                <button key={m.id} className="roster-btn" disabled={gateBusy}
+                  onClick={()=>{setGateName(m.display_name);handleJoin(m.display_name);}}>
+                  <span className="roster-radio"/>
+                  <span>
+                    <span className="roster-name">{m.display_name}</span>
+                    <span className="roster-role">{m.role}</span>
+                  </span>
+                </button>
+              ))}
+              <div className="gate-label" style={{marginTop:18}}>
+                {roster.length>0?"Not listed? Add yourself":"Enter your name"}
+              </div>
+              <input className="gate-input plain" value={gateName}
+                placeholder="Dr. Castrellon  ·  R. Patel"
+                onChange={e=>{setGateName(e.target.value);setGateErr("");}}
+                onKeyDown={e=>{if(e.key==="Enter")handleJoin();}}/>
+              {gateErr&&<div className="gate-err">{gateErr}</div>}
+              <button className="btn-p" style={{marginTop:14}}
+                disabled={gateBusy||gateName.trim().length<2} onClick={()=>handleJoin()}>
+                {gateBusy?"Joining…":"Start →"}
+              </button>
+              <div className="gate-foot">
+                <button className="gate-link" onClick={()=>{setGateStep("code");setGateErr("");}}>
+                  ← Different service
+                </button>
+              </div>
+              <div className="gate-note">
+                Your name is stamped on every entry you make. It is not a
+                password — it is what lets an error be traced and corrected.
+              </div>
+            </div>
+          )}
+
+          {gateStep==="admin"&&(
+            <div>
+              <div className="gate-label">Email</div>
+              <input className="gate-input plain" type="email" value={gateEmail} autoFocus
+                autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                onChange={e=>{setGateEmail(e.target.value);setGateErr("");}}/>
+              <div className="gate-label" style={{marginTop:14}}>Password</div>
+              <input className="gate-input plain" type="password" value={gatePass}
+                onChange={e=>{setGatePass(e.target.value);setGateErr("");}}
+                onKeyDown={e=>{if(e.key==="Enter")handleAdminSignIn();}}/>
+              {gateErr&&<div className="gate-err">{gateErr}</div>}
+              <button className="btn-p" style={{marginTop:14}}
+                disabled={gateBusy||!gateEmail.trim()||!gatePass} onClick={handleAdminSignIn}>
+                {gateBusy?"Signing in…":"Sign in →"}
+              </button>
+              <div className="gate-foot">
+                <button className="gate-link" onClick={()=>{setGateStep("code");setGateErr("");}}>
+                  ← Use a service code instead
+                </button>
+              </div>
+            </div>
+          )}
+        </motion.div>
+      </AnimatePresence>
+
+      <div className="gate-note" style={{marginTop:28}}>
+        De-identified by design · Study IDs only, no PHI<br/>
+        Research &amp; educational use only
+      </div>
+    </div>
+  );
+
+  if(!authReady) return(<><style>{css}</style><div className="boot"><div className="boot-mark">F2F</div></div></>);
+  if(!signedIn)  return(<><style>{css}</style>{renderGate()}</>);
+
   return(
     <>
       <style>{css}</style>
@@ -1601,6 +1886,13 @@ export default function F2FApp(){
             </div>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
               {screen==="wizard"&&wizStep<6&&<div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>}
+              {isSupabaseConfigured&&whoAmI&&(
+                <button className="hdr-acct" onClick={()=>setScreen("settings")}
+                  title={`${whoAmI}${serviceNm?` · ${serviceNm}`:""}`}>
+                  <span className={`sync-dot ${!syncState.online?"off":syncState.pending>0?"pending":"ok"}`}/>
+                  <span className="hdr-acct-name">{whoAmI}</span>
+                </button>
+              )}
               <div style={{display:"flex",alignItems:"baseline",gap:1,border:"1px solid #333",borderRadius:4,padding:"2px 3px"}}>
                 {[1,2,3,4].map(lvl=>(
                   <button key={lvl} onClick={()=>setFont(lvl)} title={`Text size ${lvl}`}
@@ -1632,6 +1924,14 @@ export default function F2FApp(){
         <main className="main" style={{zoom:FONT_SCALE[fontLevel]}}>
           {/* .sheet is a pass-through on mobile; ≥768px it becomes the centered white card */}
           <div className={`sheet ${screen==="records"?"sheet-wide":""}`}>
+            {isSupabaseConfigured&&(!syncState.online||syncState.pending>0)&&(
+              <div className={`sync-banner ${!syncState.online?"offline":""}`}>
+                <span className={`sync-dot ${!syncState.online?"off":"pending"}`}/>
+                {!syncState.online
+                  ? "Offline — your entries are saved on this device and will upload when you reconnect."
+                  : `Uploading ${syncState.pending} entr${syncState.pending===1?"y":"ies"}…`}
+              </div>
+            )}
             <AnimatePresence mode="wait" initial={false}>
               <motion.div key={screen}
                 initial={reduce?{opacity:0}:{opacity:0,y:8}}
