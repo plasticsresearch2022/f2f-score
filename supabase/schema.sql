@@ -258,6 +258,9 @@ begin
     raise exception 'not authenticated' using errcode = '28000';
   end if;
 
+  -- Scans active services, one bcrypt comparison each (~100ms). Fine for the
+  -- tens of rotations this study will ever have; if it grows into the hundreds,
+  -- prefix the code with the service slug and look that up first.
   select * into v_service from public.services
    where active and access_code_hash = crypt(trim(p_code), access_code_hash)
    limit 1;
