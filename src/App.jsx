@@ -325,6 +325,31 @@ function downloadCSV(text, name) {
    What an admin actually needs to see is not "all the rows" but
    "the rows something is wrong with". Ordered worst-first.
 ═══════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════
+   SECONDARY OUTCOME FIELDS
+
+   These are columns in the research workbook that the app previously had
+   no form for, so every outcome a resident entered exported with them
+   blank. Option lists are taken from the dropdown validation already
+   defined in that workbook, so the values match what Pedro expects.
+═══════════════════════════════════════════════ */
+const YNU = ["Y","N","Unknown"];
+const SECONDARY_FIELDS = [
+  { id:"debridements", label:"Debridements before surgery",  type:"number", placeholder:"0" },
+  { id:"flapType",     label:"Type of flap",                 type:"choice",
+    options:["Local rotational","Perforator based","Pedicled musculocutaneous","Free flap","Other"] },
+  { id:"minorComp",    label:"Minor complication?",          type:"choice", options:YNU },
+  { id:"minorDetail",  label:"Minor complication detail",    type:"choice",
+    options:["Minor dehiscence","Minor local superficial infection","Granuloma","Small seroma / hematoma","Other"] },
+  { id:"readmit30",    label:"30-day readmission",           type:"choice", options:YNU },
+  { id:"reop30",       label:"30-day reoperation",           type:"choice", options:YNU },
+  { id:"los",          label:"Length of stay since enrollment (days)", type:"number", placeholder:"e.g. 49" },
+  { id:"icu",          label:"ICU admission",                type:"choice", options:YNU },
+  { id:"recur90",      label:"90-day recurrence",            type:"choice", options:YNU },
+  { id:"fu30",         label:"30-day follow-up done?",       type:"choice", options:["Y","N"] },
+  { id:"fu90",         label:"90-day follow-up done?",       type:"choice", options:["Y","N"] },
+];
+
 const THIRTY_DAYS = 30*24*60*60*1000;
 
 /* Bump whenever upstream changes point values or scoring rules. Stored on
@@ -1043,6 +1068,7 @@ export default function F2FApp(){
   const [outCDOption,   setOutCDOption]   = useState("");      // selected management-level option id
   const [outNotes,      setOutNotes]      = useState("");
   const [outSaved,      setOutSaved]      = useState(false);
+  const [outSecondary,  setOutSecondary]  = useState({});   // secondary research endpoints
   const [openRecs,      setOpenRecs]      = useState({}); // collapsible non-urgent rec categories
   const [fontLevel,     setFontLevel]     = useState(()=>{ try{return parseInt(localStorage.getItem("f2f_fontlevel"))||2;}catch(e){return 2;} });
   const FONT_SCALE = {1:0.9, 2:1.0, 3:1.15, 4:1.35};
@@ -1168,8 +1194,10 @@ export default function F2FApp(){
     setXlsxBusy(true); setXlsxErr("");
     try{
       const { buildWorkbook, downloadBlob } = await import("./lib/workbook");
-      const blob = await buildWorkbook(buildResearchRows(cases,outcomes));
+      const rows = buildResearchRows(cases,outcomes);
+      const blob = await buildWorkbook(rows);
       downloadBlob(blob, `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.xlsx`);
+      adminDb.logExport("research_workbook_xlsx", rows.length);
     }catch(e){
       // Falling back to CSV beats handing back nothing, but say what happened.
       setXlsxErr(`${e.message}. Falling back to CSV — formatting will be lost.`);
@@ -1247,8 +1275,35 @@ export default function F2FApp(){
   const pct = wizStep===1?5 : wizStep===6?100 : Math.round(5+(completedDomainPages/totalDomainPages)*90);
 
   /* ── HANDLERS ── */
+  /* The Study ID is the primary key of the whole study, and it was accepted
+     as any 4+ characters — which is how "LCH-" with no number got saved.
+     Validate the shape, and refuse to start a NEW patient on an ID that
+     already exists. The de-identification log stays the authority on which
+     number comes next; this only rejects what is obviously wrong. */
+  function studyIdProblem(raw, hosp, type){
+    const id=(raw||"").trim().toUpperCase();
+    if(!id) return "Enter a Study ID.";
+    const m=id.match(/^([A-Z]{2,5})-(\d{1,4})$/);
+    if(!m) return `Use the format ${hosp?hosp.id:"LCH"}-001 — a hospital code, a dash, then a number.`;
+    if(hosp&&m[1]!==hosp.id) return `This ID starts with ${m[1]} but you selected ${hosp.name}. Expected ${hosp.id}-${m[2]}.`;
+    if(type==="new"){
+      const clash=cases.find(c=>c.studyId===id);
+      if(clash){
+        const who=clash.enteredBy?` by ${clash.enteredBy}`:"";
+        const when=(clash.enrollmentDate||clash.savedAt||"").slice(0,10);
+        return `${id} already exists${who}${when?` on ${when}`:""}. For an existing patient use Re-Assessment or Pre-Operative Score instead of New Patient.`;
+      }
+    }
+    return null;
+  }
+
+  const newIdProblem = selectedHosp&&manualId.trim() ? studyIdProblem(manualId,selectedHosp,"new") : null;
+  /* Re-assessment / pre-op: shape only — the hospital comes from the prefix. */
+  const existingIdProblem = existingId.trim() ? studyIdProblem(existingId,null,"existing") : null;
+
   function handleConfirmId(){
-    if(!selectedHosp||manualId.trim().length<4) return;
+    if(!selectedHosp) return;
+    if(studyIdProblem(manualId,selectedHosp,"new")) return;
     const id=manualId.trim().toUpperCase();
     const now=new Date().toISOString().split("T")[0];
     setStudyId(id); setHospital(selectedHosp); setEnrollDate(now);
@@ -1339,7 +1394,7 @@ export default function F2FApp(){
 
   function saveOutcome(){
     const sid=outStudyId.trim().toUpperCase();
-    if(sid.length<4) return;
+    if(studyIdProblem(sid,null,"existing")) return;
     const derivedGrade=cdGradeFromOption(outCDOption);
     const data={
       studyId:sid,
@@ -1348,6 +1403,7 @@ export default function F2FApp(){
       cdOption:outCDOption,
       notes:outNotes,
       anyEvent:OUTCOME_FIELDS.some(f=>outFields[f.id]===true),
+      secondary:{...outSecondary},
       recordedAt:new Date().toISOString(),
     };
     persistOutcome(sid,data);
@@ -1356,7 +1412,7 @@ export default function F2FApp(){
   }
 
   function resetOutcome(){
-    setOutStudyId(""); setOutFields({}); setOutCD(""); setOutCDOption(""); setOutNotes(""); setOutSaved(false);
+    setOutStudyId(""); setOutFields({}); setOutCD(""); setOutCDOption(""); setOutNotes(""); setOutSaved(false); setOutSecondary({});
   }
 
   function resetAll(){
@@ -1464,13 +1520,15 @@ export default function F2FApp(){
                 value={manualId}
                 onChange={e=>setManualId(e.target.value.toUpperCase())}
               />
-              <div style={{fontSize:11,color:"var(--k4)"}}>Enter the next Study ID from your de-identification log. Format: {selectedHosp.id}-001, {selectedHosp.id}-002, etc.</div>
+              {newIdProblem
+                ? <div className="gate-err">{newIdProblem}</div>
+                : <div style={{fontSize:11,color:"var(--k4)"}}>Enter the next Study ID from your de-identification log. Format: {selectedHosp.id}-001, {selectedHosp.id}-002, etc.</div>}
             </div>
           )}
           <div style={{marginTop:8,display:"flex",gap:8}}>
             <button className="btn-s" onClick={()=>setAssessType(null)}>← Back</button>
             <button className="btn-p" style={{flex:2}}
-              disabled={!selectedHosp||manualId.trim().length<4}
+              disabled={!selectedHosp||!manualId.trim()||Boolean(newIdProblem)}
               onClick={handleConfirmId}>
               Confirm & Continue →
             </button>
@@ -1499,10 +1557,17 @@ export default function F2FApp(){
             value={existingId}
             onChange={e=>setExistingId(e.target.value.toUpperCase())}
           />
+          {existingIdProblem
+            ? <div className="gate-err" style={{marginBottom:4}}>{existingIdProblem}</div>
+            : existingId.trim()&&!cases.some(c=>c.studyId===existingId.trim().toUpperCase())
+              ? <div className="gate-err" style={{marginBottom:4}}>
+                  No assessment exists yet for {existingId.trim().toUpperCase()}. Check the ID, or start it as a New Patient.
+                </div>
+              : null}
           <div style={{display:"flex",gap:8,marginTop:4}}>
             <button className="btn-s" onClick={()=>setAssessType(null)}>← Back</button>
             <button className="btn-p" style={{flex:2}}
-              disabled={existingId.trim().length<4}
+              disabled={!existingId.trim()||Boolean(existingIdProblem)}
               onClick={()=>{
                 const now=new Date().toISOString().split("T")[0];
                 // Infer hospital from study ID prefix
@@ -1975,10 +2040,10 @@ export default function F2FApp(){
               value={outStudyId}
               onChange={e=>{setOutStudyId(e.target.value.toUpperCase());setOutSaved(false);}}
             />
-            {sid.length>=4&&!known.includes(sid)&&(
+            {!studyIdProblem(sid,null,"existing")&&!known.includes(sid)&&(
               <div style={{fontSize:11,color:"#b45309",marginBottom:8}}>⚠ No scored assessment found for this ID on this device. You can still record the outcome — verify the ID is correct.</div>
             )}
-            {sid.length>=4&&known.includes(sid)&&(
+            {!studyIdProblem(sid,null,"existing")&&known.includes(sid)&&(
               <div style={{fontSize:11,color:"#15803d",marginBottom:8}}>✓ Study ID found in records</div>
             )}
             {existing&&(
@@ -1987,7 +2052,7 @@ export default function F2FApp(){
               </div>
             )}
 
-            {sid.length>=4&&(
+            {!studyIdProblem(sid,null,"existing")&&(
               <>
                 <div className="rule"/>
                 <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"var(--k4)",marginBottom:4}}>30-Day Major Complications</div>
@@ -2027,6 +2092,38 @@ export default function F2FApp(){
                       <span style={{fontFamily:"var(--mono)",fontSize:15,fontWeight:700,color:"var(--k)"}}>{cdGradeFromOption(outCDOption)}</span>
                     </div>
                   )}
+                </div>
+
+                {/* Secondary endpoints — the columns the research workbook
+                    tracks. All optional: an outcome can be saved on the
+                    primary endpoints alone. */}
+                <div style={{marginTop:24}}>
+                  <div className="rule"/>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"var(--k4)",marginBottom:4}}>Secondary Outcomes</div>
+                  <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:14}}>
+                    Optional, but these are columns in the research workbook — anything left blank has to be filled in by hand later.
+                  </div>
+
+                  {SECONDARY_FIELDS.map(f=>(
+                    <div key={f.id} style={{marginBottom:14}}>
+                      <div className="qlabel" style={{marginBottom:6}}>{f.label}</div>
+                      {f.type==="number"
+                        ? <input type="number" inputMode="numeric" min="0"
+                            value={outSecondary[f.id]??""}
+                            onChange={e=>setOutSecondary(p=>({...p,[f.id]:e.target.value===""?null:Number(e.target.value)}))}
+                            placeholder={f.placeholder||""}
+                            style={{width:"100%",padding:"11px 12px",border:"1px solid var(--g2)",fontFamily:"var(--mono)",fontSize:14,color:"#111",background:"#fff",outline:"none"}}/>
+                        : <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                            {f.options.map(o=>{
+                              const sel=outSecondary[f.id]===o;
+                              return(
+                                <button key={o} className={`adm-chip ${sel?"on":""}`}
+                                  onClick={()=>setOutSecondary(p=>({...p,[f.id]:sel?null:o}))}>{o}</button>
+                              );
+                            })}
+                          </div>}
+                    </div>
+                  ))}
                 </div>
 
                 <div style={{marginTop:20}}>
@@ -2218,8 +2315,8 @@ export default function F2FApp(){
             {xlsxErr&&<div className="gate-err" style={{marginBottom:12}}>{xlsxErr}</div>}
             <button className="btn-s" style={{width:"100%",marginBottom:14}}
               disabled={scoped.length===0}
-              onClick={()=>downloadCSV(buildAdminCSV(scoped,scopedOut,svcName),
-                `F2F_Audit_Export_${new Date().toISOString().split("T")[0]}.csv`)}>
+              onClick={()=>{ downloadCSV(buildAdminCSV(scoped,scopedOut,svcName),
+                `F2F_Audit_Export_${new Date().toISOString().split("T")[0]}.csv`); adminDb.logExport("audit_csv", scoped.length); }}>
               Audit export — {scoped.length} rows, one per assessment
             </button>
             {visible.length===0

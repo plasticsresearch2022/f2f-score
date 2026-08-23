@@ -423,6 +423,21 @@ begin
           jsonb_build_object('reason', trim(p_reason)));
 end; $$;
 
+-- Record that someone pulled the dataset. Of everything worth having a trail
+-- for in IRB research, "who took a copy of the data" is near the top, and the
+-- insert triggers only cover rows being created.
+create or replace function public.log_export(p_kind text, p_rows int)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not authenticated' using errcode = '28000';
+  end if;
+  insert into public.audit_log (actor_user_id, actor_name, service_id, action, entity, detail)
+  values (auth.uid(), public.actor_label(), public.current_service_id(), 'export',
+          coalesce(nullif(trim(p_kind), ''), 'unknown'),
+          jsonb_build_object('rows', greatest(coalesce(p_rows, 0), 0)));
+end; $$;
+
 -- Provision a service. Admin-only; the plaintext code is returned ONCE
 -- and never stored, so it must be copied at creation time.
 create or replace function public.create_service(
@@ -536,6 +551,7 @@ grant usage on schema public to anon, authenticated;
 grant select on public.assessments_current, public.outcomes_current to authenticated;
 grant execute on function public.redeem_service_code(text, text) to authenticated;
 grant execute on function public.void_assessment(uuid, text)      to authenticated;
+grant execute on function public.log_export(text, int)            to authenticated;
 grant execute on function public.void_outcome(uuid, text)         to authenticated;
 grant execute on function public.create_service(text, text, text, text, text) to authenticated;
 

@@ -196,3 +196,14 @@ export async function createService({ name, slug, code, hospitalId, hospitalName
   if (error) throw error;
   return data;
 }
+
+/** Record an export in the audit trail. Never blocks the download itself —
+    a failed audit write must not cost the user their file. */
+export async function logExport(kind, rowCount) {
+  if (!supabase) return;
+  try {
+    await supabase.rpc("log_export", { p_kind: kind, p_rows: rowCount });
+  } catch (e) {
+    console.warn("[F2F] export audit failed:", e?.message);
+  }
+}
