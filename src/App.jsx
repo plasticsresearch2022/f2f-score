@@ -874,8 +874,11 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .roster-radio{width:16px;height:16px;border:1.5px solid var(--g3);border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center}
 .roster-btn.sel .roster-radio{border-color:var(--k)}
 .roster-dot{width:8px;height:8px;background:var(--k);border-radius:50%}
-.roster-name{font-size:13.5px;font-weight:500;color:var(--k)}
-.roster-role{font-family:var(--mono);font-size:10px;color:var(--k4);margin-top:1px;text-transform:uppercase;letter-spacing:.06em}
+/* Both were inline spans, so the name and the role ran together as
+   "Iakov EfimenkoRESIDENT". They need to stack. */
+.roster-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.roster-name{display:block;font-size:13.5px;font-weight:500;color:var(--k);line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.roster-role{display:block;font-family:var(--mono);font-size:9.5px;color:var(--k4);text-transform:uppercase;letter-spacing:.08em;line-height:1.2}
 
 /* ── Header account + sync chips ── */
 .hdr-acct{display:flex;align-items:center;gap:7px;background:none;border:1px solid #333;color:#bbb;font-family:var(--sans);font-size:10.5px;font-weight:600;padding:4px 9px;border-radius:4px;cursor:pointer;max-width:150px}
@@ -2333,7 +2336,7 @@ export default function F2FApp(){
                 <button key={m.id} className="roster-btn" disabled={gateBusy}
                   onClick={()=>{setGateName(m.display_name);handleJoin(m.display_name);}}>
                   <span className="roster-radio"/>
-                  <span>
+                  <span className="roster-text">
                     <span className="roster-name">{m.display_name}</span>
                     <span className="roster-role">{m.role}</span>
                   </span>
