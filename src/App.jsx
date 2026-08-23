@@ -173,6 +173,109 @@ function buildFullCSV(cases, outcomes) {
    would break the line-wise append below (and most spreadsheet
    importers along with it).
 ═══════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════
+   RESEARCH EXPORT — Pedro's master workbook layout
+
+   His sheet is one row per PATIENT with the scores pivoted into
+   columns; the app stores one row per ASSESSMENT. This pivots back
+   so an export drops straight into the workbook he already uses.
+
+   Two header rows, because his top row is merged group labels.
+   Strings below are copied byte-for-byte from the real file,
+   trailing spaces and all ("Surgery  ", "LOS since enrollment
+   (days) ") — a test asserts they still match.
+
+   Columns the app cannot fill, and why:
+     Hospital Account #, DOB   PHI. Deliberately never stored — they
+                               live in the offline de-identification
+                               log. Blank here by design.
+     Age at enrollment, Sex    Not identifiers, but the app has no
+                               field for them yet.
+   Everything else comes from the database.
+═══════════════════════════════════════════════ */
+const RESEARCH_HEADER_1 = [
+  "Study ID","Hospital Account #","DOB","Age at enrollment","Sex",
+  "Scores Dates","","","","","Optimization Duration (days)",
+  "Surgery  ","","PRIMARY OUTCOMES — 30 DAYS","","","","","","","",
+  "SECONDARY OUTCOMES","","","","","","","Administrative","","",
+];
+const RESEARCH_HEADER_2 = [
+  "","","","","","First F2F score","","Reassesment","Preoperative F2F score","","",
+  "Debridements #","Type of flap",
+  "Complete Flap Failure (>75% loss)","Partial Flap Failure (>25% flap loss)",
+  "Deep SSI","Hematoma/Seroma → OR","Major Dehiscence → OR","30-day Mortality",
+  "◉ PRIMARY ENDPOINT","Clavien-Dindo Grade",
+  "Minor Complication?","Minor Comp Detail","30-day Readmission","30-day Reoperation",
+  "LOS since enrollment (days) ","ICU Admission","90-day Recurrence",
+  "30-day F/U Done?","90-day F/U Done?","Notes",
+];
+
+/* His sheet writes dates as M/D/YYYY, not ISO. */
+function usDate(v){
+  if(!v) return "";
+  const d = new Date(v);
+  if(Number.isNaN(d.getTime())) return "";
+  return `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+const yn = (v) => (v === true ? "Y" : v === false ? "N" : "");
+
+export function buildResearchCSV(cases, outcomes) {
+  const live = cases.filter(c => !c.voidedAt);
+  const outBy = new Map(outcomes.filter(o => !o.voidedAt).map(o => [o.studyId, o]));
+
+  const byStudy = new Map();
+  for (const c of live) byStudy.set(c.studyId, (byStudy.get(c.studyId) || []).concat(c));
+
+  const earliest = (rows, type) => rows
+    .filter(r => (r.assessmentType || "new") === type)
+    .sort((a, b) => new Date(a.enrollmentDate || a.savedAt) - new Date(b.enrollmentDate || b.savedAt))[0] || null;
+
+  const rows = [...byStudy.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([studyId, all]) => {
+    const first = earliest(all, "new");
+    const reassess = earliest(all, "reassessment");
+    const preop = earliest(all, "preop");
+    const o = outBy.get(studyId);
+    const s = (o && o.secondary) || {};
+    const oc = (o && o.outcomes) || {};
+
+    /* Days spent optimising between the first score and the pre-op score. */
+    let optDays = "";
+    if (first && preop) {
+      const a = new Date(first.enrollmentDate || first.savedAt);
+      const b = new Date(preop.enrollmentDate || preop.savedAt);
+      const d = Math.round((b - a) / 86400000);
+      if (Number.isFinite(d)) optDays = d;
+    }
+
+    /* Extra same-type assessments are real data with nowhere to go in this
+       layout — say so in Notes rather than dropping them silently. */
+    const extras = all.length - [first, reassess, preop].filter(Boolean).length;
+    const notes = [o?.notes, extras > 0 ? `[${extras} additional assessment${extras === 1 ? "" : "s"} not shown in this layout]` : ""]
+      .filter(Boolean).join(" · ");
+
+    return [
+      studyId, "", "", "", "",                                  // PHI + demographics: blank by design
+      first ? usDate(first.enrollmentDate || first.savedAt) : "",
+      first ? first.score : "",
+      reassess ? reassess.score : "",
+      preop ? usDate(preop.enrollmentDate || preop.savedAt) : "",
+      preop ? preop.score : "",
+      optDays,
+      s.debridements ?? "", s.flapType ?? "",
+      o ? yn(oc.cfl) : "", o ? yn(oc.pfl) : "", o ? yn(oc.ssi) : "",
+      o ? yn(oc.hem) : "", o ? yn(oc.deh) : "", o ? yn(oc.mort) : "",
+      o ? (o.anyEvent ? "YES — EVENT" : "NO event") : "",
+      o?.clavienDindo ?? "",
+      s.minorComp ?? "", s.minorDetail ?? "", s.readmit30 ?? "", s.reop30 ?? "",
+      s.los ?? "", s.icu ?? "", s.recur90 ?? "", s.fu30 ?? "", s.fu90 ?? "",
+      notes,
+    ];
+  });
+
+  const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  return [RESEARCH_HEADER_1, RESEARCH_HEADER_2, ...rows].map(r => r.map(q).join(",")).join("\n");
+}
+
 const ADMIN_EXTRA_COLS = ["Service","Hospital ID","Entered By","Record ID","Status","Void Reason"];
 
 export function buildAdminCSV(cases, outcomes, serviceNames={}) {
@@ -2047,11 +2150,22 @@ export default function F2FApp(){
           <>
             <input className="adm-search" value={admQuery} placeholder="Filter by Study ID, person, or hospital…"
               onChange={e=>setAdmQuery(e.target.value)}/>
+            <button className="btn-p" style={{marginBottom:6}}
+              disabled={scoped.length===0}
+              onClick={()=>downloadCSV(buildResearchCSV(scoped,scopedOut),
+                `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.csv`)}>
+              Export research workbook — {new Set(scoped.filter(c=>!c.voidedAt).map(c=>c.studyId)).size} patients
+            </button>
+            <div style={{fontSize:11,color:"var(--k4)",lineHeight:1.55,marginBottom:12}}>
+              Matches the master workbook layout exactly — one row per patient.
+              Hospital Account #, DOB, Age and Sex are left blank: they are not
+              stored here, so fill them from the de-identification log.
+            </div>
             <button className="btn-s" style={{width:"100%",marginBottom:14}}
               disabled={scoped.length===0}
               onClick={()=>downloadCSV(buildAdminCSV(scoped,scopedOut,svcName),
-                `F2F_Research_Export_${new Date().toISOString().split("T")[0]}.csv`)}>
-              Export {scoped.length} record{scoped.length!==1?"s":""} (CSV)
+                `F2F_Audit_Export_${new Date().toISOString().split("T")[0]}.csv`)}>
+              Audit export — {scoped.length} rows, one per assessment
             </button>
             {visible.length===0
               ? <div className="empty-state"><div className="empty-text">Nothing matches</div></div>

@@ -144,6 +144,57 @@ try {
     check("service name resolved in export", lines[1].includes("Dr. Castrellon"));
   }
 
+  /* ── Research export must reproduce the master workbook exactly ── */
+  {
+    const { buildResearchCSV } = await import(pathToFileURL(out).href);
+    const day = (n) => ymd(Date.now() - n * DAY);
+    const cases = [
+      clean({ remoteId: "a1", studyId: "PGH-002", assessmentType: "new",   score: 13, enrollmentDate: day(40) }),
+      clean({ remoteId: "a2", studyId: "PGH-002", assessmentType: "preop", score: 9,  enrollmentDate: day(30) }),
+      clean({ remoteId: "a3", studyId: "PGH-009", assessmentType: "new",   score: 14, enrollmentDate: day(10) }),
+    ];
+    const outcomes = [{
+      studyId: "PGH-002", outcomes: { cfl: false, pfl: true, ssi: false, hem: false, deh: false, mort: false },
+      anyEvent: true, clavienDindo: "IIIb", notes: "Prolonged LOS",
+      secondary: { debridements: 1, flapType: "Local rotational", minorComp: "Y", minorDetail: "Minor dehiscence",
+                   readmit30: "N", reop30: "N", los: 49, icu: "N", recur90: "Unknown", fu30: "Y", fu90: "N" },
+    }];
+    const lines = buildResearchCSV(cases, outcomes).split("\n");
+    const cells = (l) => l.slice(1, -1).split('","').map(c => c.replace(/""/g, '"'));
+
+    check("research export has two header rows + one row per patient", lines.length === 4, `${lines.length} lines`);
+
+    /* The exact header strings, including the trailing spaces in the real file. */
+    const h1 = cells(lines[0]), h2 = cells(lines[1]);
+    check("header is 31 columns wide", h1.length === 31 && h2.length === 31, `${h1.length}/${h2.length}`);
+    check("group header row matches the workbook",
+      h1[0] === "Study ID" && h1[10] === "Optimization Duration (days)" && h1[11] === "Surgery  " &&
+      h1[13] === "PRIMARY OUTCOMES — 30 DAYS" && h1[21] === "SECONDARY OUTCOMES" && h1[28] === "Administrative",
+      JSON.stringify([h1[11], h1[13]]));
+    check("field header row matches the workbook",
+      h2[5] === "First F2F score" && h2[7] === "Reassesment" && h2[8] === "Preoperative F2F score" &&
+      h2[16] === "Hematoma/Seroma → OR" && h2[19] === "◉ PRIMARY ENDPOINT" &&
+      h2[25] === "LOS since enrollment (days) " && h2[30] === "Notes",
+      JSON.stringify([h2[7], h2[19], h2[25]]));
+
+    const r = cells(lines[2]);
+    check("pivots both scores onto one patient row", r[0] === "PGH-002" && r[6] === "13" && r[9] === "9",
+      JSON.stringify(r.slice(0, 11)));
+    check("computes optimization duration from the dates", r[10] === "10", `got ${r[10]}`);
+    check("writes dates in M/D/YYYY like the workbook", /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(r[5]), r[5]);
+    check("PHI columns are blank", r[1] === "" && r[2] === "" && r[3] === "" && r[4] === "",
+      JSON.stringify(r.slice(1, 5)));
+    check("primary endpoints written as Y/N", r[13] === "N" && r[14] === "Y", `${r[13]}/${r[14]}`);
+    check("primary endpoint uses the workbook's wording", r[19] === "YES — EVENT", r[19]);
+    check("secondary outcomes land in their own columns",
+      r[11] === "1" && r[12] === "Local rotational" && r[22] === "Minor dehiscence" && r[25] === "49" && r[27] === "Unknown",
+      JSON.stringify([r[11], r[12], r[22], r[25], r[27]]));
+
+    const r2 = cells(lines[3]);
+    check("a patient with no outcome leaves outcome columns blank",
+      r2[0] === "PGH-009" && r2[19] === "" && r2[20] === "" && r2[13] === "", JSON.stringify(r2.slice(13, 21)));
+  }
+
   const width = Math.max(...results.map(([l]) => l.length));
   let bad = 0;
   for (const [label, ok, detail] of results) {

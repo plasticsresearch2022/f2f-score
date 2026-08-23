@@ -57,6 +57,7 @@ function rowToOutcome(row) {
     serviceId:    row.service_id,
     supersedesId: row.supersedes_id,
     source:       row.source,
+    secondary:    row.secondary || {},
     voidedAt:     row.voided_at,
     voidReason:   row.void_reason,
   };
@@ -97,6 +98,7 @@ function outcomeToRow(record, ctx) {
     cd_option:            record.cdOption || null,
     notes:                record.notes || null,
     any_event:            Boolean(record.anyEvent),
+    secondary:            record.secondary || {},
     supersedes_id:        record.supersedesId || null,
   };
 }

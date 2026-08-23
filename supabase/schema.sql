@@ -135,6 +135,13 @@ create table if not exists public.outcomes (
 
 alter table public.outcomes add column if not exists source text not null default 'app';
 
+-- Secondary endpoints and surgical detail the research spreadsheet tracks
+-- but the app's outcome form does not yet collect: debridements, flapType,
+-- minorComp, minorDetail, readmit30, reop30, los, icu, recur90, fu30, fu90.
+-- Kept as jsonb so the export can reproduce Pedro's sheet column-for-column
+-- without every one of these becoming a migration.
+alter table public.outcomes add column if not exists secondary jsonb not null default '{}'::jsonb;
+
 create index if not exists outcomes_service_idx on public.outcomes (service_id, recorded_at desc);
 create index if not exists outcomes_study_idx   on public.outcomes (study_id);
 

@@ -110,17 +110,22 @@ for (const r of rows) {
      adjudicated — a blank primary endpoint means follow-up is incomplete. */
   const primary = (r[C.primary] || "").trim();
   if (primary) {
-    const extra = [
-      r[C.flapType] && `Flap: ${r[C.flapType].trim()}`,
-      num(r[C.debridements]) !== null && `Debridements: ${r[C.debridements].trim()}`,
-      yes(r[C.minorComp]) && `Minor complication: ${(r[C.minorDetail] || "yes").trim()}`,
-      yes(r[C.readmit]) && "30-day readmission",
-      yes(r[C.reop]) && "30-day reoperation",
-      num(r[C.los]) !== null && `LOS since enrollment: ${r[C.los].trim()} days`,
-      yes(r[C.icu]) && "ICU admission",
-      (r[C.recur90] || "").trim() && `90-day recurrence: ${r[C.recur90].trim()}`,
-      (r[C.notes] || "").trim(),
-    ].filter(Boolean).join(" · ");
+    /* Kept as discrete fields, not flattened into the notes string — the
+       export has to reproduce each of these as its own column. */
+    const t = (i) => (r[i] || "").trim() || null;
+    const secondary = {
+      debridements: num(r[C.debridements]),
+      flapType:     t(C.flapType),
+      minorComp:    t(C.minorComp),
+      minorDetail:  t(C.minorDetail),
+      readmit30:    t(C.readmit),
+      reop30:       t(C.reop),
+      los:          num(r[C.los]),
+      icu:          t(C.icu),
+      recur90:      t(C.recur90),
+      fu30:         t(C.fu30),
+      fu90:         t(C.fu90),
+    };
 
     outcomes.push({
       sid, hid,
@@ -128,7 +133,8 @@ for (const r of rows) {
            hem: yes(r[C.hem]), deh: yes(r[C.deh]), mort: yes(r[C.mort]), ana: false },
       anyEvent: /yes/i.test(primary),
       clavien: (r[C.clavien] || "").trim() || null,
-      notes: extra || null,
+      notes: t(C.notes),
+      secondary,
       recordedAt: usDate(r[C.preopDate]) || usDate(r[C.firstDate]),
     });
   } else {
@@ -177,9 +183,10 @@ for (const a of toInsert) {
 for (const o of outcomes) {
   RUN(`insert into public.outcomes
         (user_id, service_id, study_id, outcomes, clavien_dindo, notes, any_event,
-         entered_by_name, source, recorded_at)
+         secondary, entered_by_name, source, recorded_at)
        values (${q(admin.id)}, ${q(svc.id)}, ${q(o.sid)}, ${q(JSON.stringify(o.o))}::jsonb,
                ${q(o.clavien)}, ${q(o.notes)}, ${o.anyEvent},
+               ${q(JSON.stringify(o.secondary))}::jsonb,
                ${q(BY)}, 'import', coalesce(${q(o.recordedAt)}::timestamptz, now()))`);
 }
 
