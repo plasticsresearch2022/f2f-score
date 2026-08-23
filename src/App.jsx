@@ -219,7 +219,9 @@ function usDate(v){
 }
 const yn = (v) => (v === true ? "Y" : v === false ? "N" : "");
 
-export function buildResearchCSV(cases, outcomes) {
+/* One row per patient, shaped once and consumed by both the .xlsx export
+   and the CSV fallback — so the two can never drift apart. */
+export function buildResearchRows(cases, outcomes) {
   const live = cases.filter(c => !c.voidedAt);
   const outBy = new Map(outcomes.filter(o => !o.voidedAt).map(o => [o.studyId, o]));
 
@@ -229,23 +231,16 @@ export function buildResearchCSV(cases, outcomes) {
   const earliest = (rows, type) => rows
     .filter(r => (r.assessmentType || "new") === type)
     .sort((a, b) => new Date(a.enrollmentDate || a.savedAt) - new Date(b.enrollmentDate || b.savedAt))[0] || null;
+  const yn = (v) => (v === true ? "Y" : v === false ? "N" : "");
 
-  const rows = [...byStudy.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([studyId, all]) => {
+  return [...byStudy.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([studyId, all]) => {
     const first = earliest(all, "new");
     const reassess = earliest(all, "reassessment");
     const preop = earliest(all, "preop");
     const o = outBy.get(studyId);
     const s = (o && o.secondary) || {};
     const oc = (o && o.outcomes) || {};
-
-    /* Days spent optimising between the first score and the pre-op score. */
-    let optDays = "";
-    if (first && preop) {
-      const a = new Date(first.enrollmentDate || first.savedAt);
-      const b = new Date(preop.enrollmentDate || preop.savedAt);
-      const d = Math.round((b - a) / 86400000);
-      if (Number.isFinite(d)) optDays = d;
-    }
+    const dateOf = (a) => (a ? (a.enrollmentDate || a.savedAt) : null);
 
     /* Extra same-type assessments are real data with nowhere to go in this
        layout — say so in Notes rather than dropping them silently. */
@@ -253,25 +248,37 @@ export function buildResearchCSV(cases, outcomes) {
     const notes = [o?.notes, extras > 0 ? `[${extras} additional assessment${extras === 1 ? "" : "s"} not shown in this layout]` : ""]
       .filter(Boolean).join(" · ");
 
-    return [
-      studyId, "", "", "", "",                                  // PHI + demographics: blank by design
-      first ? usDate(first.enrollmentDate || first.savedAt) : "",
-      first ? first.score : "",
-      reassess ? reassess.score : "",
-      preop ? usDate(preop.enrollmentDate || preop.savedAt) : "",
-      preop ? preop.score : "",
-      optDays,
-      s.debridements ?? "", s.flapType ?? "",
-      o ? yn(oc.cfl) : "", o ? yn(oc.pfl) : "", o ? yn(oc.ssi) : "",
-      o ? yn(oc.hem) : "", o ? yn(oc.deh) : "", o ? yn(oc.mort) : "",
-      o ? (o.anyEvent ? "YES — EVENT" : "NO event") : "",
-      o?.clavienDindo ?? "",
-      s.minorComp ?? "", s.minorDetail ?? "", s.readmit30 ?? "", s.reop30 ?? "",
-      s.los ?? "", s.icu ?? "", s.recur90 ?? "", s.fu30 ?? "", s.fu90 ?? "",
+    return {
+      studyId,
+      firstDate: dateOf(first), firstScore: first ? first.score : null,
+      reassessScore: reassess ? reassess.score : null,
+      preopDate: dateOf(preop), preopScore: preop ? preop.score : null,
+      debridements: s.debridements ?? null, flapType: s.flapType ?? "",
+      cfl: o ? yn(oc.cfl) : "", pfl: o ? yn(oc.pfl) : "", ssi: o ? yn(oc.ssi) : "",
+      hem: o ? yn(oc.hem) : "", deh: o ? yn(oc.deh) : "", mort: o ? yn(oc.mort) : "",
+      anyEvent: o ? (o.anyEvent ? "YES — EVENT" : "NO event") : "",
+      clavien: o?.clavienDindo ?? "",
+      minorComp: s.minorComp ?? "", minorDetail: s.minorDetail ?? "",
+      readmit30: s.readmit30 ?? "", reop30: s.reop30 ?? "",
+      los: s.los ?? null, icu: s.icu ?? "", recur90: s.recur90 ?? "",
+      fu30: s.fu30 ?? "", fu90: s.fu90 ?? "",
       notes,
-    ];
+    };
   });
+}
 
+export function buildResearchCSV(cases, outcomes) {
+  const rows = buildResearchRows(cases, outcomes).map(p => [
+    p.studyId, "", "", "", "",                       // PHI + demographics: blank by design
+    usDate(p.firstDate), p.firstScore ?? "", p.reassessScore ?? "",
+    usDate(p.preopDate), p.preopScore ?? "",
+    (p.firstDate && p.preopDate)
+      ? Math.round((new Date(p.preopDate) - new Date(p.firstDate)) / 86400000) : "",
+    p.debridements ?? "", p.flapType,
+    p.cfl, p.pfl, p.ssi, p.hem, p.deh, p.mort, p.anyEvent, p.clavien,
+    p.minorComp, p.minorDetail, p.readmit30, p.reop30,
+    p.los ?? "", p.icu, p.recur90, p.fu30, p.fu90, p.notes,
+  ]);
   const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   return [RESEARCH_HEADER_1, RESEARCH_HEADER_2, ...rows].map(r => r.map(q).join(",")).join("\n");
 }
@@ -299,10 +306,17 @@ export function buildAdminCSV(cases, outcomes, serviceNames={}) {
 }
 
 function downloadCSV(text, name) {
+  /* The leading BOM is not optional. Excel ignores the charset on a data:
+     URL and decodes as the system codepage, which turns every em-dash into
+     "â€"" — so "YES — EVENT" arrives mangled. A Blob plus BOM makes Excel
+     read it as UTF-8. */
+  const blob = new Blob(["﻿" + text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(text);
+  a.href = url;
   a.download = name;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /* ═══════════════════════════════════════════════
@@ -1140,6 +1154,23 @@ export default function F2FApp(){
   },[ctx]);
 
   useEffect(()=>{ if(screen==="admin") loadAdmin(); },[screen,loadAdmin]);
+
+  const [xlsxBusy, setXlsxBusy] = useState(false);
+  const [xlsxErr,  setXlsxErr]  = useState("");
+
+  async function handleExportWorkbook(cases,outcomes){
+    setXlsxBusy(true); setXlsxErr("");
+    try{
+      const { buildWorkbook, downloadBlob } = await import("./lib/workbook");
+      const blob = await buildWorkbook(buildResearchRows(cases,outcomes));
+      downloadBlob(blob, `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.xlsx`);
+    }catch(e){
+      // Falling back to CSV beats handing back nothing, but say what happened.
+      setXlsxErr(`${e.message}. Falling back to CSV — formatting will be lost.`);
+      downloadCSV(buildResearchCSV(cases,outcomes),
+        `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.csv`);
+    }finally{ setXlsxBusy(false); }
+  }
 
   async function handleVoid(kind,id,studyId){
     const reason=window.prompt(
@@ -2151,16 +2182,17 @@ export default function F2FApp(){
             <input className="adm-search" value={admQuery} placeholder="Filter by Study ID, person, or hospital…"
               onChange={e=>setAdmQuery(e.target.value)}/>
             <button className="btn-p" style={{marginBottom:6}}
-              disabled={scoped.length===0}
-              onClick={()=>downloadCSV(buildResearchCSV(scoped,scopedOut),
-                `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.csv`)}>
-              Export research workbook — {new Set(scoped.filter(c=>!c.voidedAt).map(c=>c.studyId)).size} patients
+              disabled={scoped.length===0||xlsxBusy} onClick={()=>handleExportWorkbook(scoped,scopedOut)}>
+              {xlsxBusy?"Building workbook…"
+                :`Export research workbook (.xlsx) — ${new Set(scoped.filter(c=>!c.voidedAt).map(c=>c.studyId)).size} patients`}
             </button>
             <div style={{fontSize:11,color:"var(--k4)",lineHeight:1.55,marginBottom:12}}>
-              Matches the master workbook layout exactly — one row per patient.
-              Hospital Account #, DOB, Age and Sex are left blank: they are not
-              stored here, so fill them from the de-identification log.
+              The real workbook — every sheet, colour, dropdown and formula preserved.
+              Hospital Account #, DOB and Sex are left blank: they are not stored here,
+              so paste them from the de-identification log. Age, optimization duration
+              and the primary endpoint are formulas and fill themselves in.
             </div>
+            {xlsxErr&&<div className="gate-err" style={{marginBottom:12}}>{xlsxErr}</div>}
             <button className="btn-s" style={{width:"100%",marginBottom:14}}
               disabled={scoped.length===0}
               onClick={()=>downloadCSV(buildAdminCSV(scoped,scopedOut,svcName),

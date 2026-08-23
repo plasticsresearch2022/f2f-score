@@ -10,10 +10,13 @@
     "verify:clinical": "node scripts/verify-clinical-parity.mjs",
     "smoke": "node scripts/smoke-render.mjs",
     "test:integrity": "node scripts/test-integrity.mjs",
-    "check": "npm run verify:clinical && npm run smoke && npm run test:integrity && npm run build"
+    "check": "npm run verify:clinical && npm run smoke && npm run test:integrity && npm run test:workbook && npm run build",
+    "test:workbook": "node scripts/test-workbook.mjs",
+    "build:template": "node scripts/build-workbook-template.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
+    "fflate": "^0.8.3",
     "framer-motion": "^12.40.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
