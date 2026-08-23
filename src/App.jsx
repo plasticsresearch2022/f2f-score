@@ -2409,6 +2409,35 @@ export default function F2FApp(){
   );
 
   if(!authReady) return(<><style>{css}</style><div className="boot"><div className="boot-mark">F2F</div></div></>);
+
+  /* Signed in with a real account, but neither on the admin allowlist nor
+     attached to a service. Without this they would land back on the code
+     screen with no explanation and no way out. */
+  if(isSupabaseConfigured && ctx && !ctx.isAdmin && !ctx.canCollect && !ctx.isAnonymous) return(
+    <>
+      <style>{css}</style>
+      <div className="gate">
+        <motion.div className="gate-hero" {...fade(0)}>
+          <div className="gate-brand">Fitness-to-Flap</div>
+        </motion.div>
+        <motion.div {...fade(0.08)}>
+          <div className="alert al-red" style={{marginBottom:20}}>
+            <div className="al-title" style={{color:"var(--r)"}}>Not authorised</div>
+            <div className="al-body">
+              <strong>{ctx.email}</strong> is not an approved administrator account.
+              Administrator access is limited to named research accounts.
+            </div>
+          </div>
+          <div className="gate-note" style={{marginTop:0,marginBottom:20}}>
+            If you are here to record assessments, sign out and enter your
+            service access code instead.
+          </div>
+          <button className="btn-p" onClick={handleSignOut}>Sign out</button>
+        </motion.div>
+      </div>
+    </>
+  );
+
   if(!signedIn)  return(<><style>{css}</style>{renderGate()}</>);
 
   return(

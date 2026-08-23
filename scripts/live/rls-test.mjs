@@ -157,6 +157,50 @@ try {
   check("audit logged code redemptions", (actions.redeem_code || 0) >= 2, JSON.stringify(actions));
   check("audit logged the failed code attempt", (actions.redeem_failed || 0) >= 1, JSON.stringify(actions));
 
+  /* ── Privilege escalation through the profile row ──
+     profiles is the only table a user may UPDATE, and role / service_id /
+     member_id are exactly the columns that decide what they can see. */
+  {
+    const grab = await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
+      token: B.token, method: "PATCH", prefer: "return=representation", body: { role: "admin" } });
+    const role = sql(`select role from public.profiles where id='${B.userId}'`)[0].role;
+    check("cannot self-promote to admin", role !== "admin", `http ${grab.status}, role is now ${role}`);
+  }
+  {
+    const before = sql(`select service_id from public.profiles where id='${B.userId}'`)[0].service_id;
+    const hop = await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
+      token: B.token, method: "PATCH", prefer: "return=representation", body: { service_id: svcA } });
+    const after = sql(`select service_id from public.profiles where id='${B.userId}'`)[0].service_id;
+    check("cannot move themselves onto another service", after === before,
+      `http ${hop.status}, ${before} -> ${after}`);
+
+    const leaked = await api("/rest/v1/assessments_current?select=study_id", { token: B.token });
+    check("still cannot read the other service after trying",
+      Array.isArray(leaked.d) && !leaked.d.some(r => r.study_id === "ZZ-A-001"),
+      JSON.stringify(leaked.d).slice(0, 160));
+  }
+  {
+    // profiles.email is writable, so the allowlist must not trust it.
+    await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
+      token: B.token, method: "PATCH", body: { email: "yasha.efimenko@gmail.com" } });
+    sql(`update public.profiles set full_name = full_name where id='${B.userId}'`);  // re-fire the trigger
+    const role = sql(`select role from public.profiles where id='${B.userId}'`)[0].role;
+    check("spoofing an allowlisted email does not grant admin", role !== "admin", `role is ${role}`);
+  }
+  {
+    const allow = sql(`select email from public.admin_allowlist order by email`).map(r => r.email);
+    check("allowlist holds exactly the two research accounts",
+      allow.length === 2 && allow.includes("yasha.efimenko@gmail.com") && allow.includes("plasticsresearch2022@gmail.com"),
+      allow.join(", "));
+    const admins = sql(`select p.role, u.email from public.profiles p join auth.users u on u.id=p.id where p.role='admin'`);
+    check("only allowlisted accounts hold admin",
+      admins.every(a => allow.includes(String(a.email).toLowerCase())),
+      admins.map(a => a.email).join(", "));
+    const hidden = await api("/rest/v1/admin_allowlist?select=email", { token: B.token });
+    check("collectors cannot read the allowlist",
+      Array.isArray(hidden.d) && hidden.d.length === 0, JSON.stringify(hidden.d).slice(0, 120));
+  }
+
   /* ── Admin can void; collectors cannot ── */
   const collectorVoid = await api("/rest/v1/rpc/void_assessment", {
     token: A.token, method: "POST", body: { p_id: rowA.id, p_reason: "nope" } });
@@ -174,7 +218,7 @@ try {
     const left = sql(`select (select count(*)::int from public.services where slug like 'zztest-%') as svc,
                              (select count(*)::int from auth.users where is_anonymous) as anon,
                              (select count(*)::int from public.assessments) as assessments`)[0];
-    console.log(`\ncleanup: services=${left.svc} anon_users=${left.anon} assessments=${left.assessments} (16 legacy expected)\n`);
+    console.log(`\nx\n`);
   } catch (e) { console.error("CLEANUP FAILED:", e.message); }
 }
 

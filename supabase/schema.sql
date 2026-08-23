@@ -165,6 +165,54 @@ create index if not exists audit_log_at_idx      on public.audit_log (at desc);
 create index if not exists audit_log_service_idx on public.audit_log (service_id, at desc);
 
 -- ═══════════════════════════════════════════════
+-- 5b. ADMIN ALLOWLIST
+--
+-- Admin is not something a profile row can claim. It is granted only to
+-- the addresses listed here, enforced by a trigger on every insert and
+-- update, so the answer is the same however the row is written.
+-- ═══════════════════════════════════════════════
+create table if not exists public.admin_allowlist (
+  email    text primary key,
+  added_at timestamptz not null default now()
+);
+
+insert into public.admin_allowlist (email) values
+  ('yasha.efimenko@gmail.com'),
+  ('plasticsresearch2022@gmail.com')
+on conflict (email) do nothing;
+
+create or replace function public.enforce_admin_role()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_email text;
+begin
+  -- Resolved from auth.users, NOT from new.email. profiles.email is
+  -- client-writable, so trusting it would let anyone type an allowlisted
+  -- address into their own row and be promoted.
+  select lower(u.email) into v_email from auth.users u where u.id = new.id;
+
+  if v_email is not null and exists (
+       select 1 from public.admin_allowlist a where lower(a.email) = v_email) then
+    new.role := 'admin';
+  elsif new.role = 'admin' then
+    new.role := 'collector';       -- silently demote anyone else
+  end if;
+  return new;
+end; $$;
+
+drop trigger if exists profiles_enforce_admin on public.profiles;
+create trigger profiles_enforce_admin
+  before insert or update on public.profiles
+  for each row execute function public.enforce_admin_role();
+
+-- Re-evaluate every existing row against the list.
+update public.profiles set role = role;
+
+alter table public.admin_allowlist enable row level security;
+drop policy if exists allowlist_admin_read on public.admin_allowlist;
+create policy allowlist_admin_read on public.admin_allowlist for select
+  using (public.is_admin());
+
+-- ═══════════════════════════════════════════════
 -- 6. HELPERS
 -- SECURITY DEFINER so they bypass RLS internally — without that,
 -- a profiles policy calling is_admin() would recurse forever.
@@ -437,6 +485,10 @@ drop policy if exists own_profile on public.profiles;
 create policy own_profile on public.profiles for select
   using (auth.uid() = id or public.is_admin());
 
+-- A user may edit their own row, but the columns that decide what they can
+-- see are locked at the GRANT level below — a policy alone cannot restrict
+-- columns, and this policy would otherwise let anyone set their own role or
+-- move themselves onto another service.
 drop policy if exists own_profile_write on public.profiles;
 create policy own_profile_write on public.profiles for update
   using (auth.uid() = id) with check (auth.uid() = id);
@@ -491,6 +543,13 @@ grant execute on function public.create_service(text, text, text, text, text) to
 revoke select on public.services from anon, authenticated;
 grant select (id, name, slug, hospital_id, hospital_name, active, created_at)
   on public.services to authenticated;
+
+-- role, service_id and member_id decide what a session can see, so they are
+-- not client-writable at all. Only the SECURITY DEFINER RPCs (which run as
+-- the owner and bypass these grants) may set them. RLS cannot express a
+-- column restriction, so this has to be a GRANT.
+revoke update on public.profiles from anon, authenticated;
+grant update (full_name, specialty) on public.profiles to authenticated;
 
 -- ═══════════════════════════════════════════════
 -- 13. BOOTSTRAP — run ONCE, by hand, then delete the plaintext
