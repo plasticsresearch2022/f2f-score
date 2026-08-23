@@ -33,10 +33,16 @@ function readUpstreamSha() {
   return m[1];
 }
 
+/* Git normalises line endings on checkout under core.autocrlf, so the working
+   file can be CRLF while the stored blob is LF. Comparing raw then reports
+   every section as drifted at once — which is noise that would train someone
+   to ignore a check whose whole job is to be believed. Compare content. */
+const normalize = (s) => s.replace(/\r\n/g, "\n").replace(/\s+$/, "");
+
 /* Slice from a top-level declaration to the next one. The file is
    deliberately single-file and flat, so this is reliable. */
 function section(src, name) {
-  const lines = src.split("\n");
+  const lines = normalize(src).split("\n");
   const start = new RegExp(`^(?:const|function|async function)\\s+${name}\\b`);
   const s = lines.findIndex((l) => start.test(l));
   if (s < 0) return null;
