@@ -888,8 +888,10 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .sync-dot.ok{background:#16a34a}
 .sync-dot.pending{background:#ca8a04}
 .sync-dot.off{background:#666}
+.sync-dot.bad{background:var(--r)}
 .sync-banner{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#fefce8;border-left:2px solid #ca8a04;font-size:12px;color:#713f12;margin-bottom:16px;line-height:1.5}
 .sync-banner.offline{background:var(--g1);border-color:var(--g3);color:var(--k3)}
+.sync-banner.failed{align-items:flex-start;background:#fff8f8;border-left-width:3px;border-color:var(--r);color:#7f1d1d;padding:12px 14px}
 
 /* ═══════════════════════════════════════════════
    ADMIN — monitoring across every service
@@ -1089,7 +1091,8 @@ export default function F2FApp(){
     return()=>sync.stop();
   },[ctx]);
 
-  useEffect(()=>sync.onSyncChange(setSyncState),[]);
+  const [failedList, setFailedList] = useState([]);
+  useEffect(()=>sync.onSyncChange(s=>{ setSyncState(s); setFailedList(sync.failedRecords()); }),[]);
 
   const signedIn  = !isSupabaseConfigured || Boolean(ctx?.canCollect) || Boolean(ctx?.isAdmin);
   const whoAmI    = ctx?.displayName || deviceIdentity()?.display_name || "";
@@ -1188,8 +1191,19 @@ export default function F2FApp(){
   }
 
   async function handleSignOut(){
+    /* Sign-out wipes the local cache so a shared device leaks nothing — which
+       would also destroy anything that never made it to the server. */
+    const unsaved = sync.failedCount() + sync.pendingCount();
+    if(unsaved>0){
+      const ids = sync.failedRecords().map(f=>f.studyId).join(", ");
+      const ok = window.confirm(
+        `${unsaved} entr${unsaved===1?"y has":"ies have"} not been saved to the research database yet` +
+        `${ids?` (${ids})`:""}.\n\nSigning out erases them from this device permanently.\n\n` +
+        `Cancel and reconnect if you can. Sign out anyway?`);
+      if(!ok) return;
+    }
     await signOut();
-    sync.clearLocalCache();   // shared device — leave nothing behind
+    sync.clearLocalCache();
     setCtx(null); setCases([]); setGateStep("code"); setGateName(""); setScreen("home");
   }
 
@@ -1879,6 +1893,8 @@ export default function F2FApp(){
                     </div>
                   </div>
                   <div className="record-right">
+                    {isSupabaseConfigured&&c._sync==="failed"&&<span className="adm-flagpill">not saved</span>}
+                    {isSupabaseConfigured&&c._sync!=="failed"&&c._sync!=="synced"&&<span className="adm-flagpill warn">pending</span>}
                     <span className="record-score">{c.score}</span>
                     <TierChip tierId={c.tierId}/>
                   </div>
@@ -2053,12 +2069,16 @@ export default function F2FApp(){
               {ctx.isAdmin&&<><br/><span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--r)",fontWeight:700}}>ADMINISTRATOR</span></>}
             </div>
             <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:12}}>
-              {!syncState.online
-                ? "OFFLINE — entries are saved on this device and will upload automatically"
-                : syncState.pending>0
-                  ? `SYNCING — ${syncState.pending} entr${syncState.pending===1?"y":"ies"} waiting to upload`
-                  : syncState.cloud ? "SYNCED — all entries are saved to the research database"
-                                    : "LOCAL ONLY — not connected to the research database"}
+              {syncState.failed>0
+                ? <span style={{color:"var(--r)",fontWeight:700}}>
+                    NOT SAVED — {syncState.failed} entr{syncState.failed===1?"y":"ies"} never reached the database
+                  </span>
+                : !syncState.online
+                  ? "OFFLINE — entries are saved on this device and will upload automatically"
+                  : syncState.pending>0
+                    ? `SYNCING — ${syncState.pending} entr${syncState.pending===1?"y":"ies"} waiting to upload`
+                    : syncState.cloud ? "SYNCED — all entries are saved to the research database"
+                                      : "LOCAL ONLY — not connected to the research database"}
             </div>
             <button className="btn-s" style={{width:"100%"}} onClick={handleSignOut}>Sign out</button>
           </div>
@@ -2458,7 +2478,11 @@ export default function F2FApp(){
               {isSupabaseConfigured&&whoAmI&&(
                 <button className="hdr-acct" onClick={()=>setScreen("settings")}
                   title={`${whoAmI}${serviceNm?` · ${serviceNm}`:""}`}>
-                  <span className={`sync-dot ${!syncState.online?"off":syncState.pending>0?"pending":"ok"}`}/>
+                  {/* Green only when the server has confirmed everything. */}
+                  <span className={`sync-dot ${
+                    syncState.failed>0 ? "bad"
+                    : !syncState.online ? "off"
+                    : syncState.pending>0 ? "pending" : "ok"}`}/>
                   <span className="hdr-acct-name">{whoAmI}</span>
                 </button>
               )}
@@ -2493,6 +2517,30 @@ export default function F2FApp(){
         <main className="main" style={{zoom:FONT_SCALE[fontLevel]}}>
           {/* .sheet is a pass-through on mobile; ≥768px it becomes the centered white card */}
           <div className={`sheet ${screen==="records"?"sheet-wide":""}`}>
+            {/* Failures come first and stay put — this is the one thing a
+                resident must not miss, because the entry is NOT in the study. */}
+            {isSupabaseConfigured&&syncState.failed>0&&(
+              <div className="sync-banner failed">
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:700,marginBottom:3}}>
+                    {syncState.failed} entr{syncState.failed===1?"y was":"ies were"} not saved to the research database
+                  </div>
+                  <div style={{lineHeight:1.5}}>
+                    {failedList.map(f=>f.studyId).join(", ")} — still on this device, but not recorded.
+                    Do not clear your browser data.
+                  </div>
+                  {failedList[0]?.reason&&(
+                    <div style={{marginTop:4,fontFamily:"var(--mono)",fontSize:10.5,opacity:.8}}>
+                      {failedList[0].reason}
+                    </div>
+                  )}
+                  <button className="btn-s" style={{marginTop:8,width:"auto",padding:"7px 14px"}}
+                    onClick={()=>sync.retryFailed().then(()=>setFailedList(sync.failedRecords()))}>
+                    Try again
+                  </button>
+                </div>
+              </div>
+            )}
             {isSupabaseConfigured&&(!syncState.online||syncState.pending>0)&&(
               <div className={`sync-banner ${!syncState.online?"offline":""}`}>
                 <span className={`sync-dot ${!syncState.online?"off":"pending"}`}/>

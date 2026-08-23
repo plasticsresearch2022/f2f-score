@@ -44,20 +44,54 @@ const ls = {
 function queue() { return ls.json(QUEUE_KEY) || []; }
 function setQueue(q) { ls.set(QUEUE_KEY, JSON.stringify(q)); }
 
-/** Mark a locally-written record as needing a push. Safe to call twice. */
+/**
+ * Mark a locally-written record as needing a push.
+ *
+ * The identity is captured HERE, not at upload time. Otherwise an entry
+ * still sitting in the outbox when someone redeems a different service
+ * code would upload stamped with the new service — silently attributing
+ * one service's patient to another.
+ */
 export function enqueue(kind, key) {
   const q = queue();
   if (!q.some(e => e.key === key)) {
-    q.push({ kind, key, at: Date.now() });
+    q.push({
+      kind, key, at: Date.now(), state: "pending",
+      ctx: ctx ? { userId: ctx.userId, serviceId: ctx.serviceId,
+                   memberId: ctx.memberId, displayName: ctx.displayName } : null,
+    });
     setQueue(q);
   }
-  // Opportunistic: if we happen to be online and ready, drain now.
   if (canPush() && navigator.onLine !== false) flush().catch(() => {});
 }
 
 function dequeue(key) { setQueue(queue().filter(e => e.key !== key)); }
 
-export function pendingCount() { return queue().length; }
+/** Move an entry out of the retry loop but keep it visible and recoverable. */
+function markFailed(key, reason) {
+  setQueue(queue().map(e => (e.key === key ? { ...e, state: "failed", reason, failedAt: Date.now() } : e)));
+}
+
+const pendingEntries = () => queue().filter(e => e.state !== "failed");
+const failedEntries  = () => queue().filter(e => e.state === "failed");
+
+export function pendingCount() { return pendingEntries().length; }
+export function failedCount()  { return failedEntries().length; }
+
+/** Study IDs of everything that did not make it, for the warning banner. */
+export function failedRecords() {
+  return failedEntries().map(e => {
+    const rec = ls.json(e.key) || {};
+    return { key: e.key, kind: e.kind, studyId: rec.studyId || "(unknown)", reason: e.reason || "unknown error" };
+  });
+}
+
+/** Put failed entries back in the queue — used by the Retry button. */
+export function retryFailed() {
+  setQueue(queue().map(e => (e.state === "failed" ? { ...e, state: "pending", reason: undefined } : e)));
+  notify(status());
+  return flush();
+}
 
 /* ── Context ─────────────────────────────────── */
 
@@ -77,10 +111,15 @@ function notify(state) { for (const fn of listeners) { try { fn(state); } catch 
 export function onSyncChange(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 
 export function status() {
+  const failed = failedCount();
   return {
-    online:    typeof navigator === "undefined" ? true : navigator.onLine !== false,
-    cloud:     canPush(),
-    pending:   pendingCount(),
+    online:  typeof navigator === "undefined" ? true : navigator.onLine !== false,
+    cloud:   canPush(),
+    pending: pendingCount(),
+    failed,
+    /* The single flag the UI trusts. Only true when the server has confirmed
+       everything — never merely because the retry loop gave up. */
+    allSaved: failed === 0 && pendingCount() === 0,
   };
 }
 
@@ -96,29 +135,43 @@ export async function flush() {
   if (!canPush() || flushing) return;
   flushing = true;
   try {
-    for (const entry of queue()) {
+    for (const entry of pendingEntries()) {
       const record = ls.json(entry.key);
       if (!record) { dequeue(entry.key); continue; }
       if (record._sync === "synced") { dequeue(entry.key); continue; }
 
+      /* Upload under the identity the entry was made with. If the session has
+         since moved to another service, hold it rather than misattribute it. */
+      const stamp = entry.ctx;
+      if (stamp && stamp.serviceId && stamp.serviceId !== ctx.serviceId) {
+        markFailed(entry.key,
+          "Entered under a different service than the one now signed in. Sign back in to that service to upload it.");
+        continue;
+      }
+      const useCtx = stamp && stamp.serviceId ? { ...ctx, ...stamp } : ctx;
+
       try {
         if (entry.kind === "case") {
-          const saved = await insertAssessment(record, ctx);
+          const saved = await insertAssessment(record, useCtx);
           // Re-key to the confirmed id so a later pull does not duplicate it.
           ls.del(entry.key);
           ls.set(`${CASE_PREFIX}${saved.studyId}_r_${saved.remoteId}`,
                  JSON.stringify({ ...record, ...saved, _sync: "synced" }));
         } else {
-          const saved = await insertOutcome(record, ctx);
+          const saved = await insertOutcome(record, useCtx);
           ls.set(`${OUTCOME_PREFIX}${saved.studyId}`,
                  JSON.stringify({ ...record, ...saved, _sync: "synced" }));
         }
         dequeue(entry.key);
       } catch (err) {
         if (isPermanent(err)) {
-          console.warn("[F2F] sync rejected permanently, kept locally:", entry.key, err?.message);
-          ls.set(entry.key, JSON.stringify({ ...record, _sync: "rejected", _error: err?.message }));
-          dequeue(entry.key);
+          /* Do NOT dequeue. Dropping it here is what made a lost record look
+             saved: the pending count fell to zero, the indicator went green,
+             and the row still showed in Records. It stays visible until
+             someone deals with it. */
+          console.warn("[F2F] sync rejected:", entry.key, err?.message);
+          ls.set(entry.key, JSON.stringify({ ...record, _sync: "failed", _error: err?.message }));
+          markFailed(entry.key, err?.message || "rejected by the server");
         } else {
           break;   // network/transient — stop, keep order, retry later
         }
