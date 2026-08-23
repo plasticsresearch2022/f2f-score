@@ -131,7 +131,8 @@ function buildFullCSV(cases, outcomes) {
     "PI Location","Wound Size","Osteomyelitis","Prior Flap","Soiling","Irradiated Bed",
     "Diabetes HbA1c","Smoking","Cardiopulmonary/Renal","Chronic Steroids",
     "Self-Repositioning","No Pressure Surface","Social Support",
-    "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier","Timestamp",
+    "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier",
+    "Projected Score","Projected Improvement","Projected Tier","Timestamp",
     // 30-day outcome columns (populated once per Study ID)
     "Complete Flap Failure","Partial Flap Failure","Deep SSI","Hematoma/Seroma","Major Dehiscence",
     "Anastomotic Failure","30d Mortality","PRIMARY ENDPOINT","Clavien-Dindo","Outcome Notes","Outcome Recorded"];
@@ -143,7 +144,8 @@ function buildFullCSV(cases, outcomes) {
       a.location||"",a.woundSize||"",a.osteomyelitis||"",a.priorFlap||"",a.soiling||"",a.irradiated?"Y":"N",
       a.diabetes||"",a.smoking||"",a.cardio||"",a.steroids?"Y":"N",
       a.selfReposition||"",a.pressureSurface?"Y":"N",a.socialSupport||"",
-      d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,c.savedAt,
+      d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,
+      c.projectedScore??"",c.projectedImprovement??"",c.projectedTierLabel??"",c.savedAt,
       o?(oc.cfl?"Y":"N"):"",o?(oc.pfl?"Y":"N"):"",o?(oc.ssi?"Y":"N"):"",o?(oc.hem?"Y":"N"):"",o?(oc.deh?"Y":"N"):"",
       o?(oc.ana?"Y":"N"):"",o?(oc.mort?"Y":"N"):"",o?(o.anyEvent?"YES — EVENT":"NO event"):"",
       o?o.clavienDindo:"",o?o.notes:"",o?o.recordedAt:""];
@@ -174,7 +176,7 @@ const DOMAINS = [
       hint:"Chronic nutritional status marker — half-life 18–20 days",
       options:[
         {v:"a",label:"≥ 3.5",pts:0},{v:"b",label:"3.0 – 3.49",pts:1},{v:"c",label:"2.5 – 2.99",pts:3},
-        {v:"ci",label:"< 2.5",pts:0,isCI:true,ciLabel:"Red Flag"},
+        {v:"ci",label:"< 2.5",pts:3,isCI:true,ciLabel:"Red Flag",flagId:"albumin"},
       ]},
     { id:"prealbumin", type:"radio", label:"Prealbumin", unit:"mg/dL",
       hint:"Short-term nutritional response marker — half-life 2–3 days",
@@ -189,7 +191,7 @@ const DOMAINS = [
       hint:"Select 'Not ordered' for clean wounds without infection concern",
       options:[
         {v:"a",label:"< 0.5",pts:0},{v:"b",label:"0.5 – 2.0",pts:2},
-        {v:"ci",label:"> 2.0  or  clinical sepsis",pts:0,isCI:true,ciLabel:"Red Flag"},
+        {v:"ci",label:"> 2.0  or  clinical sepsis",pts:2,isCI:true,ciLabel:"Red Flag",flagId:"pct"},
         {v:"no",label:"Not ordered — clean wound / no infection concern",pts:0},
       ]},
     { id:"inflammation", type:"toggle", pts:2, label:"Elevated inflammatory markers",
@@ -206,7 +208,7 @@ const DOMAINS = [
       options:[{v:"a",label:"< 50",pts:0},{v:"b",label:"50 – 100",pts:1},{v:"c",label:"> 100",pts:2}]},
     { id:"osteomyelitis", type:"radio", label:"Osteomyelitis",
       options:[
-        {v:"a",label:"None",pts:0},
+        {v:"a",label:"None or treated (culture-negative, completed antibiotic course)",pts:0},
         {v:"b",label:"Chronic (> 4 weeks) — sequestrum or sinus tract",pts:1},
         {v:"c",label:"Acute (≤ 4 weeks) — purulent, no sequestrum",pts:3},
       ]},
@@ -227,12 +229,16 @@ const DOMAINS = [
     { id:"smoking", type:"radio", label:"Smoking Status",
       options:[
         {v:"a",label:"Never smoker or former (> 6 months abstinence)",pts:0},
-        {v:"b",label:"Current or quit < 6 months ago",pts:2},
+        {v:"c",label:"Cessation ≥ 2 weeks before surgery",pts:1},
+        {v:"b",label:"Current or quit < 2 weeks ago",pts:2},
       ]},
     { id:"cardio", type:"radio", label:"Major Cardiopulmonary / Renal Disease",
+      hint:"Symptomatic status drives the score more than the number of conditions",
       options:[
-        {v:"a",label:"None",pts:0},{v:"b",label:"One stable condition",pts:1},
-        {v:"c",label:"≥ 2 conditions or symptomatic",pts:2},
+        {v:"a",label:"None",pts:0},
+        {v:"b",label:"One stable condition",pts:1},
+        {v:"d",label:"Multiple conditions — asymptomatic",pts:1},
+        {v:"c",label:"Symptomatic (any number of conditions)",pts:2},
       ]},
     { id:"steroids", type:"toggle", pts:2, label:"Chronic Steroid Use",
       hint:"≥ 30 days of > 20 mg/day prednisone equivalent" },
@@ -253,7 +259,7 @@ const DOMAINS = [
       options:[
         {v:"a", label:"Reliable 24/7 care available",pts:0},
         {v:"b", label:"Some support — inconsistent",pts:2},
-        {v:"ci",label:"No support system available",pts:0,isCI:true,ciLabel:"Red Flag"},
+        {v:"ci",label:"No support system available",pts:2,isCI:true,ciLabel:"Red Flag",flagId:"support"},
       ]},
   ]},
 ];
@@ -281,6 +287,37 @@ const TIERS = [
     bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c"},
 ];
 
+/* ═══════════════════════════════════════════════
+   RED FLAG GATE — overrides the numeric tier.
+   Any in-domain red flag makes the patient Not an
+   Ideal Candidate until corrected, regardless of score.
+═══════════════════════════════════════════════ */
+const FLAG_TIER = {
+  id:"flagged", label:"NOT AN IDEAL CANDIDATE",
+  verdict:"Red flag present — reversible. Correct, then re-score.",
+  headline:"Do not proceed with flap reconstruction until the flagged condition is addressed. These conditions are reversible — re-score once corrected.",
+  timing:null,
+  bg:"#fee2e2", bar:"#dc2626", ink:"#7f1d1d", accent:"#b91c1c",
+};
+
+const FLAG_ACTIONS = {
+  albumin: {
+    title:"Albumin < 2.5 g/dL — Severe Hypoalbuminemia",
+    kind:"Laboratory value",
+    text:"Confirm the laboratory value first — verify it is not a transient or erroneous result. Begin aggressive nutritional optimization (high-protein intake ≥ 1.5 g/kg/day, dietitian involvement, enteral support if needed). Note that albumin has an 18–20 day half-life and will not correct quickly — expect weeks, not days. Track response with prealbumin (2–3 day half-life). Re-score once albumin has meaningfully improved.",
+  },
+  pct: {
+    title:"PCT > 2.0 ng/mL or Clinical Sepsis",
+    kind:"Laboratory value / clinical",
+    text:"Confirm the result and treat the underlying infection or sepsis before any reconstruction. Obtain cultures and initiate organism-directed antibiotics. Perform serial wound debridements to optimize local infection control and reduce bioburden. NPWT or NPWTi-d may be used as an adjunct between debridements. Re-score once the infection is controlled and markers normalize.",
+  },
+  support: {
+    title:"No Support System Available",
+    kind:"Structural / social barrier",
+    text:"Reliable post-operative support is essential for flap survival and wound care adherence. Involve case management and social work early to build the full support plan the patient needs — caregiver arrangements, home health, placement, transportation, and follow-up logistics. This is a reversible barrier once a durable 24/7 support structure is secured. Re-score once support is confirmed in place.",
+  },
+};
+
 function computeScore(answers) {
   let total=0; const ciFlags=[]; const domainScores={};
   for (const domain of DOMAINS) {
@@ -290,7 +327,7 @@ function computeScore(answers) {
       if(f.type==="toggle"){ ds+=val===true?f.pts:0; }
       else{
         const opt=f.options?.find(o=>o.v===val);
-        if(opt){ if(opt.isCI) ciFlags.push({field:f.label,label:opt.ciLabel}); else ds+=opt.pts; }
+        if(opt){ if(opt.isCI){ ciFlags.push({field:f.label,label:opt.ciLabel,flagId:opt.flagId}); ds+=opt.pts; } else ds+=opt.pts; }
       }
     }
     // Cap each domain at its maximum — raw points above the cap do not carry over
@@ -302,6 +339,61 @@ function computeScore(answers) {
 
 function getTier(score){ return TIERS.find(t=>score>=t.min&&score<=t.max)??TIERS[0]; }
 const isIschial=(loc)=>loc==="ischial";
+
+/* ═══════════════════════════════════════════════
+   OPTIMIZATION PROJECTION
+   Modifiable variables can realistically improve within
+   a pre-op optimization window. The projection assumes
+   each modifiable variable improves by ONE tier (not to
+   zero) — a deliberately conservative best-case estimate.
+═══════════════════════════════════════════════ */
+const DOMAIN_COLORS = {bio:"#4472a6", wound:"#c0397f", comorbidities:"#2e8b84", functional:"#6b4c9a"};
+
+const MODIFIABLE = new Set([
+  "albumin","prealbumin","bmi","pct","inflammation",   // Domain 1
+  "osteomyelitis","soiling",                            // Domain 2
+  "diabetes","smoking",                                 // Domain 3
+  "pressureSurface","socialSupport",                    // Domain 4
+]);
+// FIXED (for reference): location, woundSize, priorFlap, irradiated,
+//                        cardio, steroids, selfReposition
+
+// Move a radio field one point-tier better (toward fewer points).
+function oneLevelBetter(field, opt){
+  const tiers=[...new Set(field.options.map(o=>o.pts))].sort((a,b)=>a-b);
+  const idx=tiers.indexOf(opt.pts);
+  if(idx<=0) return opt;                       // already best tier
+  const target=tiers[idx-1];
+  const cands=field.options.filter(o=>o.pts===target);
+  return cands.find(o=>!o.isCI)||cands[0];     // prefer a non-flag option
+}
+
+function projectScore(answers){
+  let total=0; const domainScores={}; const projFlags=[]; const supportImproves={};
+  for(const domain of DOMAINS){
+    let ds=0;
+    for(const f of domain.fields){
+      const val=answers[f.id];
+      const mod=MODIFIABLE.has(f.id);
+      if(f.type==="toggle"){
+        const on=val===true;
+        const projOn=mod?false:on;             // improving a toggle = turn it off
+        ds+=projOn?f.pts:0;
+      } else {
+        const opt=f.options?.find(o=>o.v===val);
+        if(!opt) continue;
+        const proj=mod?oneLevelBetter(f,opt):opt;
+        if(proj.isCI) projFlags.push({flagId:proj.flagId});
+        ds+=proj.pts;
+        // does the social-support variable actually improve?
+        if(f.id==="socialSupport" && proj.pts<opt.pts) supportImproves.social=true;
+      }
+    }
+    ds=Math.min(ds,domain.maxPts);
+    domainScores[domain.id]=ds; total+=ds;
+  }
+  return {total,domainScores,projFlags,supportImproves};
+}
 
 function buildRecs(answers,tierId){
   const recs=[]; const mod=tierId==="moderate"; const hi=tierId==="high";
@@ -492,7 +584,7 @@ function RadioField({field,value,onChange}){
           const s=value===opt.v,ci=opt.isCI,cls=s?(ci?"sel-ci":"sel"):"";
           return(<button key={opt.v} className={`opt ${cls}`} onClick={()=>onChange(field.id,opt.v)}>
             <span className={`opt-lbl ${cls}`}>{opt.label}</span>
-            <span className={`opt-pts ${cls}`}>{ci?opt.ciLabel:`+${opt.pts}`}</span>
+            <span className={`opt-pts ${cls}`}>{ci?`+${opt.pts} ⚑`:`+${opt.pts}`}</span>
           </button>);
         })}
       </div>
@@ -531,8 +623,59 @@ function RecCard({rec,index}){
 }
 
 function TierChip({tierId}){
-  const labels={low:"Low",moderate:"Moderate",high:"High",not_ideal:"Not Ideal"};
-  return <span className={`tier-chip ${tierId}`}>{labels[tierId]||tierId}</span>;
+  const labels={low:"Low",moderate:"Moderate",high:"High",not_ideal:"Not Ideal",flagged:"⚑ Red Flag"};
+  return <span className={`tier-chip ${tierId==="flagged"?"not_ideal":tierId}`}>{labels[tierId]||tierId}</span>;
+}
+
+/* Master projection: current vs projected on the full 0–30 scale.
+   Two stacked bars, each colored by its own tier, with faint tier
+   threshold ticks at 5 / 12 / 19. */
+function MasterProjectionBar({ total, tier, projTotal, projTier, improvement }){
+  const MAX=30;
+  const pct=(v)=>`${Math.max(0,Math.min(100,(v/MAX)*100))}%`;
+  const ticks=[5,12,19];
+  return(
+    <div style={{border:"1px solid var(--g2)",borderRadius:10,padding:"16px",marginBottom:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:12}}>
+        <div style={{fontSize:10,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:"var(--k4)"}}>Optimization Potential</div>
+        {improvement>0&&<div style={{fontFamily:"var(--mono)",fontSize:12,fontWeight:700,color:projTier.accent}}>−{improvement} possible</div>}
+      </div>
+
+      {/* Current */}
+      <div style={{marginBottom:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+          <span style={{fontSize:10,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase",color:"var(--k4)"}}>Current</span>
+          <span style={{fontFamily:"var(--mono)",fontSize:12,fontWeight:700,color:tier.accent}}>{total}/30 · {tier.label}</span>
+        </div>
+        <div style={{position:"relative",height:20,background:"#f1f1f1",borderRadius:5,overflow:"hidden"}}>
+          <div style={{position:"absolute",left:0,top:0,bottom:0,width:pct(total),background:tier.bar,borderRadius:5,transition:"width .4s"}}/>
+          {ticks.map(t=><div key={t} style={{position:"absolute",left:pct(t),top:0,bottom:0,width:1,background:"#fff",opacity:.6}}/>)}
+        </div>
+      </div>
+
+      {/* Projected */}
+      <div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+          <span style={{fontSize:10,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase",color:"var(--k4)"}}>After optimization</span>
+          <span style={{fontFamily:"var(--mono)",fontSize:12,fontWeight:700,color:projTier.accent}}>{projTotal}/30 · {projTier.label}</span>
+        </div>
+        <div style={{position:"relative",height:20,background:"#f1f1f1",borderRadius:5,overflow:"hidden"}}>
+          {improvement>0&&(
+            <div style={{position:"absolute",left:pct(projTotal),top:0,bottom:0,width:`calc(${pct(total)} - ${pct(projTotal)})`,
+              background:`repeating-linear-gradient(45deg, ${tier.bar}44, ${tier.bar}44 5px, ${tier.bar}18 5px, ${tier.bar}18 10px)`}}/>
+          )}
+          <div style={{position:"absolute",left:0,top:0,bottom:0,width:pct(projTotal),background:projTier.bar,borderRadius:5,transition:"width .4s"}}/>
+          {ticks.map(t=><div key={t} style={{position:"absolute",left:pct(t),top:0,bottom:0,width:1,background:"#fff",opacity:.6}}/>)}
+        </div>
+      </div>
+
+      <div style={{fontSize:10.5,color:"var(--k4)",marginTop:12,lineHeight:1.5,fontStyle:"italic"}}>
+        {improvement>0
+          ? "Conservative estimate — each modifiable factor improved by one tier. Re-score after optimization to capture the actual value."
+          : "This score reflects primarily fixed factors with limited modifiable potential."}
+      </div>
+    </div>
+  );
 }
 
 /* ═══════════════════════════════════════════════
@@ -600,8 +743,13 @@ export default function F2FApp(){
   },[currentPage,answers]);
 
   const {total,ciFlags,domainScores}=useMemo(()=>computeScore(answers),[answers]);
-  const tier=getTier(total);
-  const recs=useMemo(()=>buildRecs(answers,tier.id),[answers,tier.id]);
+  const hasScoreFlags = ciFlags.length>0;
+  const tier = hasScoreFlags ? FLAG_TIER : getTier(total);
+  const proj = useMemo(()=>projectScore(answers),[answers]);
+  const projTier = proj.projFlags.length>0 ? FLAG_TIER : getTier(proj.total);
+  const projImprovement = total - proj.total;
+  const numericTier = getTier(total);
+  const recs=useMemo(()=>buildRecs(answers,numericTier.id),[answers,numericTier.id]);
 
   // Progress: 5% for flags, 90% spread across all domain pages, 5% buffer
   const totalDomainPages = DOMAINS.reduce((sum,d)=>sum+getDomainPages(d).length,0);
@@ -643,6 +791,9 @@ export default function F2FApp(){
             assessmentType:assessType||"new",
             savedAt:new Date().toISOString(), answers:{...answers}, score:total,
             tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
+            flagged:hasScoreFlags, flagIds:ciFlags.map(c=>c.flagId),
+            projectedScore:proj.total, projectedImprovement:projImprovement,
+            projectedTierLabel:projTier.label, projectedDomainScores:{...proj.domainScores},
           };
           persistCase(caseData);
           setCases(fetchAllCases());
@@ -1019,16 +1170,18 @@ export default function F2FApp(){
               {tier.verdict}
             </div>
 
-            {/* Primary recommendation — bold, high contrast */}
-            <div style={{background:"#fff",borderRadius:10,padding:"14px 16px",marginTop:4}}>
-              <div style={{fontSize:9,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:tier.accent,marginBottom:5}}>Recommendation</div>
-              <div style={{fontSize:15,fontWeight:600,color:"#111",lineHeight:1.45}}>{tier.headline}</div>
-              {tier.timing&&(
-                <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:12,color:tier.accent,fontWeight:600,letterSpacing:".04em"}}>
-                  ⏱ OPTIMIZATION WINDOW · {tier.timing}
-                </div>
-              )}
-            </div>
+            {/* Primary recommendation — shown only for numeric tiers, not when flag-gated */}
+            {!hasScoreFlags&&(
+              <div style={{background:"#fff",borderRadius:10,padding:"14px 16px",marginTop:4}}>
+                <div style={{fontSize:9,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:tier.accent,marginBottom:5}}>Recommendation</div>
+                <div style={{fontSize:15,fontWeight:600,color:"#111",lineHeight:1.45}}>{tier.headline}</div>
+                {tier.timing&&(
+                  <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:12,color:tier.accent,fontWeight:600,letterSpacing:".04em"}}>
+                    ⏱ OPTIMIZATION WINDOW · {tier.timing}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {!isQuick&&(
@@ -1039,7 +1192,7 @@ export default function F2FApp(){
 
           <div style={{marginBottom:20}}>
             <button className={`copy-btn ${copied?"copied":""}`} onClick={handleCopy}>
-              {copied?"✓ Copied to clipboard":"📋 Copy Results to Clipboard"}
+              {copied?"✓ Copied":"📋 Save Results to Clipboard"}
             </button>
             {copyFallback&&(
               <div>
@@ -1050,29 +1203,73 @@ export default function F2FApp(){
           </div>
 
           {ciFlags.length>0&&(
-            <div className="alert al-red" style={{marginBottom:20}}>
-              <div className="al-title" style={{color:"var(--r)"}}>Surgical Risk Red Flags — Identified During Scoring</div>
-              {ciFlags.map((c,i)=><div key={i} className="al-body" style={{color:"var(--r)",marginBottom:2}}>• {c.field} — {c.label}</div>)}
+            <div style={{marginBottom:24}}>
+              <div style={{border:"1px solid var(--r)",borderRadius:10,overflow:"hidden"}}>
+                <div style={{background:"var(--r)",padding:"11px 16px"}}>
+                  <div style={{fontSize:11,fontWeight:800,letterSpacing:".08em",textTransform:"uppercase",color:"#fff"}}>⚑ Correct Before Flap Reconstruction</div>
+                </div>
+                <div style={{padding:"4px 16px 16px"}}>
+                  {ciFlags.map((c,i)=>{
+                    const act=FLAG_ACTIONS[c.flagId];
+                    if(!act) return (
+                      <div key={i} style={{paddingTop:14}}>
+                        <div style={{fontSize:12.5,fontWeight:700,color:"var(--r)"}}>{c.field} — {c.label}</div>
+                      </div>
+                    );
+                    return(
+                      <div key={i} style={{paddingTop:14,borderTop:i>0?"1px solid #f0dede":"none",marginTop:i>0?14:0}}>
+                        <div style={{fontSize:13,fontWeight:700,color:"var(--r)",marginBottom:2}}>{act.title}</div>
+                        <div style={{fontSize:10,fontWeight:600,letterSpacing:".06em",textTransform:"uppercase",color:"#c88",marginBottom:6}}>{act.kind}</div>
+                        <div style={{fontSize:13,color:"var(--k2)",lineHeight:1.7}}>{act.text}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           )}
 
+          <MasterProjectionBar total={total} tier={tier} projTotal={proj.total} projTier={projTier} improvement={projImprovement}/>
+
           <div style={{marginBottom:24}}>
-            <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+              <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)"}}>Score Breakdown</div>
+            </div>
+            <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:16,lineHeight:1.5}}>
+              Per domain: solid bar = current, slim bar = projected after optimization.
+            </div>
             {DOMAINS.map(d=>{
               const ds=domainScores[d.id]??0;
+              const pd=proj.domainScores[d.id]??ds;
+              const delta=ds-pd;
+              const col=DOMAIN_COLORS[d.id]||"#666";
+              // caption: domain 4 uses support wording only when support is the driver
+              let cap;
+              if(delta<=0) cap="No modifiable factors";
+              else if(d.id==="functional"&&proj.supportImproves.social) cap="Projected after support system implementation";
+              else cap="Projected after optimization";
               return(
-                <div className="b-row" key={d.id}>
-                  <span className="b-name">{d.label}</span>
-                  <div className="b-right">
-                    <div className="b-bar-wrap"><div className="b-bar-fill" style={{width:`${Math.min((ds/d.maxPts)*100,100)}%`}}/></div>
-                    <span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{d.maxPts}</span></span>
+                <div key={d.id} style={{marginBottom:16}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:5}}>
+                    <span style={{fontSize:12.5,fontWeight:600,color:"var(--k)"}}>{d.label}</span>
+                    <span style={{fontFamily:"var(--mono)",fontSize:12,color:"var(--k2)"}}>{ds} <span style={{color:"var(--k4)"}}>/ {d.maxPts}</span></span>
+                  </div>
+                  <div style={{position:"relative",height:15,background:"#f1f1f1",borderRadius:4,overflow:"hidden"}}>
+                    <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${Math.min((ds/d.maxPts)*100,100)}%`,background:col,borderRadius:4,transition:"width .4s"}}/>
+                  </div>
+                  <div style={{position:"relative",height:6,background:"#f4f4f4",borderRadius:3,overflow:"hidden",marginTop:4}}>
+                    <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${Math.min((pd/d.maxPts)*100,100)}%`,background:col,opacity:.5,borderRadius:3,transition:"width .4s"}}/>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginTop:3}}>
+                    <span style={{fontSize:9.5,letterSpacing:".03em",color:delta>0?"var(--k4)":"#ccc"}}>{cap}</span>
+                    <span style={{fontFamily:"var(--mono)",fontSize:11,fontWeight:700,color:delta>0?col:"#ccc"}}>{delta>0?`−${delta}`:"—"}</span>
                   </div>
                 </div>
               );
             })}
             <div className="b-total" style={{marginTop:12}}>
               <span className="b-total-lbl">Total F2F Score</span>
-              <span className="b-total-pts">{total} pts</span>
+              <span className="b-total-pts">{total} pts{projImprovement>0&&<span style={{fontSize:12,fontWeight:600,color:projTier.accent,marginLeft:8}}>→ {proj.total} projected</span>}</span>
             </div>
           </div>
 
@@ -1216,7 +1413,7 @@ export default function F2FApp(){
 
   const renderDetail=()=>{
     if(!selCase) return null;
-    const t=TIERS.find(t=>t.id===selCase.tierId)||TIERS[0];
+    const t=(selCase.tierId==="flagged"?FLAG_TIER:TIERS.find(t=>t.id===selCase.tierId))||TIERS[0];
     const d=selCase.domainScores||{};
     const detailRecs=buildRecs(selCase.answers||{},selCase.tierId);
     return(
