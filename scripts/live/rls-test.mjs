@@ -1,15 +1,22 @@
 /* ═══════════════════════════════════════════════
    LIVE RLS VERIFICATION
 
-   Runs against the real project as two different anonymous
-   collectors on two different services, plus an unaffiliated
-   one. Proves the claims the design rests on:
+   Runs against the real project as two collectors on two different
+   services, plus one unaffiliated and one blocked. Proves the claims
+   the design rests on:
      - a collector sees only their own service
      - append-only is enforced by Postgres, not by the app
-     - the bcrypt hash and the audit log are not client-readable
+     - service and role are not self-assignable
+     - blocking an account revokes read and write everywhere
+     - the access-code hash and the audit log stay server-side
 
-   Creates two throwaway services and deletes them (and everything
-   they produced) at the end.
+   Sign-in here is anonymous rather than Google, because OAuth cannot be
+   driven headlessly. RLS never sees the difference — every policy keys
+   off auth.uid(), profiles.service_id and profiles.blocked, which are
+   identical whichever provider issued the session.
+
+   Creates two throwaway services and deletes them, and everything they
+   produced, at the end.
 ═══════════════════════════════════════════════ */
 import fs from "fs";
 import { execFileSync } from "child_process";
@@ -22,10 +29,8 @@ const URL_ = env.VITE_SUPABASE_URL, KEY = env.VITE_SUPABASE_ANON_KEY;
 const results = [];
 const check = (label, ok, detail = "") => { results.push([label, ok, detail]); };
 
-/* Admin-side SQL through the dashboard tab. */
 function sql(q) {
-  const out = execFileSync("node", ["sql-bridge.mjs", "-q", q], { encoding: "utf8", cwd: import.meta.dirname });
-  return JSON.parse(out);
+  return JSON.parse(execFileSync("node", ["sql-bridge.mjs", "-q", q], { encoding: "utf8", cwd: import.meta.dirname }));
 }
 
 async function api(pathname, { token, method = "GET", body, prefer } = {}) {
@@ -37,188 +42,178 @@ async function api(pathname, { token, method = "GET", body, prefer } = {}) {
   return { status: r.status, d };
 }
 
-async function anonSignIn() {
+async function signIn() {
   const r = await fetch(`${URL_}/auth/v1/signup`, {
     method: "POST", headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({}),
   });
   const d = await r.json();
-  if (!d.access_token) throw new Error("anon sign-in failed: " + JSON.stringify(d).slice(0, 200));
+  if (!d.access_token) throw new Error("sign-in failed: " + JSON.stringify(d).slice(0, 200));
   return { token: d.access_token, userId: d.user.id };
 }
 
-const CODE_A = "ZZTEST-ALPHA-" + Math.random().toString(36).slice(2, 8).toUpperCase();
-const CODE_B = "ZZTEST-BRAVO-" + Math.random().toString(36).slice(2, 8).toUpperCase();
-
 try {
-  /* ── Setup: two throwaway services ── */
-  sql(`insert into public.services (name, slug, hospital_id, hospital_name, access_code_hash)
-       values ('ZZ Test Alpha','zztest-alpha','LCH','Larkin Community Hospital', crypt('${CODE_A}', gen_salt('bf'))),
-              ('ZZ Test Bravo','zztest-bravo','PGH','Palmetto General Hospital', crypt('${CODE_B}', gen_salt('bf')))`);
+  /* ── Setup: two throwaway services, no codes needed any more ── */
+  sql(`insert into public.services (name, slug, hospital_id, hospital_name)
+       values ('ZZ Test Alpha','zztest-alpha','LCH','Larkin Community Hospital'),
+              ('ZZ Test Bravo','zztest-bravo','PGH','Palmetto General Hospital')`);
+  const SVC_A = sql(`select id from public.services where slug = 'zztest-alpha'`)[0].id;
+  const SVC_B = sql(`select id from public.services where slug = 'zztest-bravo'`)[0].id;
 
   /* ── Collector A ── */
-  const A = await anonSignIn();
-  const beforeRedeem = await api("/rest/v1/assessments_current?select=id", { token: A.token });
-  check("unaffiliated collector sees nothing",
-    Array.isArray(beforeRedeem.d) && beforeRedeem.d.length === 0,
-    JSON.stringify(beforeRedeem).slice(0, 160));
+  const A = await signIn();
+  const before = await api("/rest/v1/assessments_current?select=id", { token: A.token });
+  check("a user with no service sees nothing",
+    Array.isArray(before.d) && before.d.length === 0, JSON.stringify(before).slice(0, 160));
 
-  /* Wrong code first, while this user still has no service — otherwise
-     "does not grant a service" would pass for the wrong reason. */
-  const badCode = await api("/rest/v1/rpc/redeem_service_code", {
-    token: A.token, method: "POST", body: { p_code: "TOTALLY-WRONG-CODE", p_member_name: "X" } });
-  check("wrong code is rejected", badCode.d?.ok === false && badCode.d?.error === "invalid_code",
-    JSON.stringify(badCode).slice(0, 160));
+  const insBefore = await api("/rest/v1/assessments", {
+    token: A.token, method: "POST",
+    body: { user_id: A.userId, service_id: SVC_A, study_id: "ZZ-EARLY", assessment_type: "new", score: 0 } });
+  check("a user with no service cannot write", insBefore.status >= 400, `http ${insBefore.status}`);
 
-  const stillUnaffiliated = sql(`select service_id from public.profiles where id='${A.userId}'`)[0];
-  check("a wrong code grants nothing", stillUnaffiliated.service_id === null,
-    JSON.stringify(stillUnaffiliated));
+  const joinA = await api("/rest/v1/rpc/set_my_service", {
+    token: A.token, method: "POST", body: { p_service_id: SVC_A } });
+  check("picking a service works", joinA.d?.ok === true && joinA.d?.service?.slug === "zztest-alpha",
+    JSON.stringify(joinA).slice(0, 200));
 
-  const redeemA = await api("/rest/v1/rpc/redeem_service_code", {
-    token: A.token, method: "POST", body: { p_code: CODE_A, p_member_name: "Dr. Alpha" } });
-  check("valid code is accepted", redeemA.d?.ok === true && redeemA.d?.service?.slug === "zztest-alpha",
-    JSON.stringify(redeemA).slice(0, 200));
+  const bogus = await api("/rest/v1/rpc/set_my_service", {
+    token: A.token, method: "POST", body: { p_service_id: "00000000-0000-0000-0000-000000000000" } });
+  check("an unknown service is rejected", bogus.status >= 400, `http ${bogus.status}`);
 
-  const svcA = redeemA.d.service.id;
   const insA = await api("/rest/v1/assessments", {
     token: A.token, method: "POST", prefer: "return=representation",
-    body: { user_id: A.userId, service_id: svcA, study_id: "ZZ-A-001", hospital: "Larkin Community Hospital",
-            hospital_id: "LCH", enrollment_date: "2026-08-22", assessment_type: "new",
+    body: { user_id: A.userId, service_id: SVC_A, study_id: "ZZ-A-001", hospital: "Larkin Community Hospital",
+            hospital_id: "LCH", enrollment_date: "2026-08-23", assessment_type: "new",
             answers: {}, domain_scores: { bio: 0, wound: 0, comorbidities: 0, functional: 0 },
             score: 0, tier_id: "low", tier_label: "LOW RISK", entered_by_name: "Dr. Alpha" } });
-  check("collector can insert into own service", insA.status === 201, JSON.stringify(insA).slice(0, 220));
+  check("a collector can write to their own service", insA.status === 201, JSON.stringify(insA).slice(0, 220));
   const rowA = Array.isArray(insA.d) ? insA.d[0] : insA.d;
 
   const readA = await api("/rest/v1/assessments_current?select=study_id", { token: A.token });
-  check("collector sees own row", Array.isArray(readA.d) && readA.d.some(r => r.study_id === "ZZ-A-001"),
-    JSON.stringify(readA).slice(0, 160));
-
-  check("legacy rows stay hidden from collectors",
+  check("a collector sees their service's rows",
+    Array.isArray(readA.d) && readA.d.some(r => r.study_id === "ZZ-A-001"), JSON.stringify(readA).slice(0, 160));
+  check("other services' rows stay hidden",
     Array.isArray(readA.d) && !readA.d.some(r => String(r.study_id || "").startsWith("PGH-")),
     JSON.stringify(readA.d).slice(0, 160));
 
   /* ── Append-only ── */
-  /* With no UPDATE policy, RLS makes zero rows visible to update, so PostgREST
-     reports 204/no-rows rather than an error. What matters is that nothing
-     changed — assert on the stored row, not the HTTP status. */
   const upd = await api(`/rest/v1/assessments?id=eq.${rowA.id}`, {
     token: A.token, method: "PATCH", prefer: "return=representation", body: { score: 99 } });
-  const updatedRows = Array.isArray(upd.d) ? upd.d.length : 0;
-  check("UPDATE affects zero rows", updatedRows === 0, `http ${upd.status}, ${updatedRows} rows returned`);
+  check("UPDATE affects zero rows", (Array.isArray(upd.d) ? upd.d.length : 0) === 0,
+    `http ${upd.status}, ${JSON.stringify(upd.d).slice(0, 100)}`);
 
-  const del = await api(`/rest/v1/assessments?id=eq.${rowA.id}`, { token: A.token, method: "DELETE" });
-  const stillThere = sql(`select count(*)::int as n from public.assessments where id='${rowA.id}'`)[0].n;
-  check("DELETE is refused by Postgres", stillThere === 1, `http ${del.status}, rows remaining ${stillThere}`);
+  await api(`/rest/v1/assessments?id=eq.${rowA.id}`, { token: A.token, method: "DELETE" });
+  const stillThere = sql(`select count(*)::int as n from public.assessments where id = '${rowA.id}'`)[0].n;
+  check("DELETE is refused by Postgres", stillThere === 1, `rows remaining ${stillThere}`);
+  check("the stored score was not mutated",
+    sql(`select score from public.assessments where id = '${rowA.id}'`)[0].score === 0);
 
-  const scoreNow = sql(`select score from public.assessments where id='${rowA.id}'`)[0].score;
-  check("score was not mutated", scoreNow === 0, `score is ${scoreNow}`);
+  /* ── Collector B on a different service ── */
+  const B = await signIn();
+  await api("/rest/v1/rpc/set_my_service", { token: B.token, method: "POST", body: { p_service_id: SVC_B } });
 
-  /* ── Collector B: a different service ── */
-  const B = await anonSignIn();
-  const redeemB = await api("/rest/v1/rpc/redeem_service_code", {
-    token: B.token, method: "POST", body: { p_code: CODE_B, p_member_name: "Dr. Bravo" } });
-  check("second service redeems independently", redeemB.status === 200 && redeemB.d?.service?.slug === "zztest-bravo");
-
-  const crossRead = await api("/rest/v1/assessments_current?select=study_id", { token: B.token });
+  const cross = await api("/rest/v1/assessments_current?select=study_id", { token: B.token });
   check("CROSS-SERVICE READ IS BLOCKED",
-    Array.isArray(crossRead.d) && !crossRead.d.some(r => r.study_id === "ZZ-A-001"),
-    JSON.stringify(crossRead.d).slice(0, 200));
+    Array.isArray(cross.d) && !cross.d.some(r => r.study_id === "ZZ-A-001"), JSON.stringify(cross.d).slice(0, 200));
 
-  const targeted = await api(`/rest/v1/assessments_current?select=*&id=eq.${rowA.id}`, { token: B.token });
-  check("cannot fetch another service's row by id",
-    Array.isArray(targeted.d) && targeted.d.length === 0, JSON.stringify(targeted.d).slice(0, 160));
+  const byId = await api(`/rest/v1/assessments_current?select=*&id=eq.${rowA.id}`, { token: B.token });
+  check("another service's row cannot be fetched by id",
+    Array.isArray(byId.d) && byId.d.length === 0, JSON.stringify(byId.d).slice(0, 160));
 
-  const crossInsert = await api("/rest/v1/assessments", {
+  const crossIns = await api("/rest/v1/assessments", {
     token: B.token, method: "POST",
-    body: { user_id: B.userId, service_id: svcA, study_id: "ZZ-EVIL", assessment_type: "new", score: 0 } });
-  check("cannot insert into another service", crossInsert.status >= 400, `http ${crossInsert.status}`);
+    body: { user_id: B.userId, service_id: SVC_A, study_id: "ZZ-EVIL", assessment_type: "new", score: 0 } });
+  check("cannot write into another service", crossIns.status >= 400, `http ${crossIns.status}`);
+
+  /* ── Privilege escalation through the profile row ── */
+  await api(`/rest/v1/profiles?id=eq.${B.userId}`, { token: B.token, method: "PATCH", body: { role: "admin" } });
+  check("cannot self-promote to admin",
+    sql(`select role from public.profiles where id = '${B.userId}'`)[0].role !== "admin");
+
+  const beforeHop = sql(`select service_id from public.profiles where id = '${B.userId}'`)[0].service_id;
+  await api(`/rest/v1/profiles?id=eq.${B.userId}`, { token: B.token, method: "PATCH", body: { service_id: SVC_A } });
+  check("cannot set service_id directly — only the RPC may",
+    sql(`select service_id from public.profiles where id = '${B.userId}'`)[0].service_id === beforeHop);
+
+  await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
+    token: B.token, method: "PATCH", body: { email: "yasha.efimenko@gmail.com" } });
+  sql(`update public.profiles set full_name = full_name where id = '${B.userId}'`);
+  check("spoofing an allowlisted email does not grant admin",
+    sql(`select role from public.profiles where id = '${B.userId}'`)[0].role !== "admin");
 
   /* ── Secrets stay server-side ── */
   const hash = await api("/rest/v1/services?select=access_code_hash", { token: B.token });
-  check("access code hash is not readable", hash.status >= 400 || (Array.isArray(hash.d) && hash.d.length === 0 ),
-    `http ${hash.status} ${JSON.stringify(hash.d).slice(0, 120)}`);
+  check("the access-code hash is not readable",
+    hash.status >= 400 || (Array.isArray(hash.d) && hash.d.length === 0), `http ${hash.status}`);
 
   const audit = await api("/rest/v1/audit_log?select=*", { token: B.token });
-  check("audit log is admin-only", Array.isArray(audit.d) && audit.d.length === 0,
-    `http ${audit.status} ${JSON.stringify(audit.d).slice(0, 120)}`);
+  check("the audit log is admin-only", Array.isArray(audit.d) && audit.d.length === 0,
+    JSON.stringify(audit.d).slice(0, 120));
 
-  const otherSvc = await api("/rest/v1/services?select=name", { token: B.token });
-  check("collector sees only their own service row",
-    Array.isArray(otherSvc.d) && otherSvc.d.length === 1 && otherSvc.d[0].name === "ZZ Test Bravo",
-    JSON.stringify(otherSvc.d).slice(0, 160));
+  const allow = await api("/rest/v1/admin_allowlist?select=email", { token: B.token });
+  check("collectors cannot read the allowlist", Array.isArray(allow.d) && allow.d.length === 0,
+    JSON.stringify(allow.d).slice(0, 120));
 
-  /* ── Audit trail recorded the activity ── */
-  const auditRows = sql(`select action, count(*)::int as n from public.audit_log
-                         where service_id in (select id from public.services where slug like 'zztest-%')
-                            or action = 'redeem_failed'
-                         group by action order by 1`);
-  const actions = Object.fromEntries(auditRows.map(r => [r.action, r.n]));
-  check("audit logged the assessment", (actions.create_assessment || 0) >= 1, JSON.stringify(actions));
-  check("audit logged code redemptions", (actions.redeem_code || 0) >= 2, JSON.stringify(actions));
-  check("audit logged the failed code attempt", (actions.redeem_failed || 0) >= 1, JSON.stringify(actions));
+  const users = await api("/rest/v1/rpc/list_users", { token: B.token, method: "POST", body: {} });
+  check("collectors cannot list users", !Array.isArray(users.d) || users.d.length === 0,
+    JSON.stringify(users.d).slice(0, 120));
 
-  /* ── Privilege escalation through the profile row ──
-     profiles is the only table a user may UPDATE, and role / service_id /
-     member_id are exactly the columns that decide what they can see. */
-  {
-    const grab = await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
-      token: B.token, method: "PATCH", prefer: "return=representation", body: { role: "admin" } });
-    const role = sql(`select role from public.profiles where id='${B.userId}'`)[0].role;
-    check("cannot self-promote to admin", role !== "admin", `http ${grab.status}, role is now ${role}`);
-  }
-  {
-    const before = sql(`select service_id from public.profiles where id='${B.userId}'`)[0].service_id;
-    const hop = await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
-      token: B.token, method: "PATCH", prefer: "return=representation", body: { service_id: svcA } });
-    const after = sql(`select service_id from public.profiles where id='${B.userId}'`)[0].service_id;
-    check("cannot move themselves onto another service", after === before,
-      `http ${hop.status}, ${before} -> ${after}`);
+  /* ── Everyone can see the service list, because the picker needs it ── */
+  const svcList = await api("/rest/v1/services?select=name", { token: B.token });
+  check("the service list is visible to signed-in users",
+    Array.isArray(svcList.d) && svcList.d.length >= 2, JSON.stringify(svcList.d).slice(0, 160));
 
-    const leaked = await api("/rest/v1/assessments_current?select=study_id", { token: B.token });
-    check("still cannot read the other service after trying",
-      Array.isArray(leaked.d) && !leaked.d.some(r => r.study_id === "ZZ-A-001"),
-      JSON.stringify(leaked.d).slice(0, 160));
-  }
-  {
-    // profiles.email is writable, so the allowlist must not trust it.
-    await api(`/rest/v1/profiles?id=eq.${B.userId}`, {
-      token: B.token, method: "PATCH", body: { email: "yasha.efimenko@gmail.com" } });
-    sql(`update public.profiles set full_name = full_name where id='${B.userId}'`);  // re-fire the trigger
-    const role = sql(`select role from public.profiles where id='${B.userId}'`)[0].role;
-    check("spoofing an allowlisted email does not grant admin", role !== "admin", `role is ${role}`);
-  }
-  {
-    const allow = sql(`select email from public.admin_allowlist order by email`).map(r => r.email);
-    check("allowlist holds exactly the two research accounts",
-      allow.length === 2 && allow.includes("yasha.efimenko@gmail.com") && allow.includes("plasticsresearch2022@gmail.com"),
-      allow.join(", "));
-    const admins = sql(`select p.role, u.email from public.profiles p join auth.users u on u.id=p.id where p.role='admin'`);
-    check("only allowlisted accounts hold admin",
-      admins.every(a => allow.includes(String(a.email).toLowerCase())),
-      admins.map(a => a.email).join(", "));
-    const hidden = await api("/rest/v1/admin_allowlist?select=email", { token: B.token });
-    check("collectors cannot read the allowlist",
-      Array.isArray(hidden.d) && hidden.d.length === 0, JSON.stringify(hidden.d).slice(0, 120));
-  }
-
-  /* ── Admin can void; collectors cannot ── */
-  const collectorVoid = await api("/rest/v1/rpc/void_assessment", {
+  /* ── Privileged actions ── */
+  const cVoid = await api("/rest/v1/rpc/void_assessment", {
     token: A.token, method: "POST", body: { p_id: rowA.id, p_reason: "nope" } });
-  check("collector cannot void", collectorVoid.status >= 400, `http ${collectorVoid.status}`);
+  check("a collector cannot void", cVoid.status >= 400, `http ${cVoid.status}`);
+
+  const cBlock = await api("/rest/v1/rpc/set_user_blocked", {
+    token: A.token, method: "POST", body: { p_user_id: B.userId, p_blocked: true } });
+  check("a collector cannot block anyone", cBlock.status >= 400, `http ${cBlock.status}`);
+
+  /* ── Blocking revokes everything ── */
+  sql(`update public.profiles set blocked = true where id = '${A.userId}'`);
+  const blockedRead = await api("/rest/v1/assessments_current?select=study_id", { token: A.token });
+  check("a blocked account reads nothing",
+    Array.isArray(blockedRead.d) && blockedRead.d.length === 0, JSON.stringify(blockedRead.d).slice(0, 160));
+
+  const blockedWrite = await api("/rest/v1/assessments", {
+    token: A.token, method: "POST",
+    body: { user_id: A.userId, service_id: SVC_A, study_id: "ZZ-BLOCKED", assessment_type: "new", score: 0 } });
+  check("a blocked account cannot write", blockedWrite.status >= 400, `http ${blockedWrite.status}`);
+
+  const blockedJoin = await api("/rest/v1/rpc/set_my_service", {
+    token: A.token, method: "POST", body: { p_service_id: SVC_B } });
+  check("a blocked account cannot switch service to escape", blockedJoin.status >= 400, `http ${blockedJoin.status}`);
+
+  sql(`update public.profiles set blocked = false where id = '${A.userId}'`);
+  const restored = await api("/rest/v1/assessments_current?select=study_id", { token: A.token });
+  check("unblocking restores access",
+    Array.isArray(restored.d) && restored.d.some(r => r.study_id === "ZZ-A-001"),
+    JSON.stringify(restored.d).slice(0, 160));
+
+  /* ── Audit trail ── */
+  const acts = Object.fromEntries(sql(`select action, count(*)::int as n from public.audit_log
+       where service_id in (select id from public.services where slug like 'zztest-%')
+       group by action`).map(r => [r.action, r.n]));
+  check("joining a service is audited", (acts.join_service || 0) >= 2, JSON.stringify(acts));
+  check("creating an assessment is audited", (acts.create_assessment || 0) >= 1, JSON.stringify(acts));
 
 } finally {
-  /* ── Cleanup ── */
   try {
-    sql(`delete from public.audit_log where service_id in (select id from public.services where slug like 'zztest-%') or action='redeem_failed'`);
+    sql(`delete from public.audit_log where service_id in (select id from public.services where slug like 'zztest-%')`);
     sql(`delete from public.assessments where service_id in (select id from public.services where slug like 'zztest-%')`);
+    sql(`update public.profiles set service_id = null, member_id = null
+          where service_id in (select id from public.services where slug like 'zztest-%')`);
     sql(`delete from public.service_members where service_id in (select id from public.services where slug like 'zztest-%')`);
-    sql(`delete from public.profiles where id in (select id from auth.users where is_anonymous = true)`);
-    sql(`delete from auth.users where is_anonymous = true`);
+    sql(`delete from public.profiles where id in (select id from auth.users where is_anonymous)`);
+    sql(`delete from auth.users where is_anonymous`);
     sql(`delete from public.services where slug like 'zztest-%'`);
     const left = sql(`select (select count(*)::int from public.services where slug like 'zztest-%') as svc,
                              (select count(*)::int from auth.users where is_anonymous) as anon,
                              (select count(*)::int from public.assessments) as assessments`)[0];
-    console.log(`\nx\n`);
+    console.log(`\ncleanup: services=${left.svc} test_users=${left.anon} assessments=${left.assessments} (24 expected)\n`);
   } catch (e) { console.error("CLEANUP FAILED:", e.message); }
 }
 

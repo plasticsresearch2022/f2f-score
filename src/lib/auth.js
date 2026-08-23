@@ -3,20 +3,15 @@ import { supabase, isSupabaseConfigured } from "./supabase";
 /* ═══════════════════════════════════════════════
    AUTH
 
-   Two very different doors into the same app:
+   One door: Google. The Gmail account IS the identity, which is
+   the point — a resident's patients follow them to whatever
+   device they pick up, and "who entered this" survives a cleared
+   browser. Nothing is remembered per device.
 
-   COLLECTORS (residents, attendings on a rotation)
-     Anonymous Supabase session + a service access code.
-     No email, no password, no reset flow. One step, once
-     per device. Friction here is the whole reason data
-     ends up in a spreadsheet instead of a database.
-
-   ADMINS (research oversight)
-     Real email + password. Few enough to provision by hand,
-     and they need an identity that survives a cleared browser.
+   First sign-in ends on "which service are you on?". After that
+   it goes straight through. Admin is decided server-side by
+   admin_allowlist, never by anything the client sends.
 ═══════════════════════════════════════════════ */
-
-const DEVICE_KEY = "f2f_device_identity";  // remembered roster choice
 
 /* ── Session ─────────────────────────────────── */
 
@@ -33,57 +28,35 @@ export function onAuthChange(cb) {
 }
 
 export async function signOut() {
-  clearDeviceIdentity();
   if (supabase) await supabase.auth.signOut();
 }
 
-/* ── Collector: service access code ──────────── */
+/* ── Service selection ───────────────────────── */
 
-/**
- * Redeem a service access code.
- * Signs in anonymously first if there is no session yet, then calls the
- * redeem RPC, which verifies the code server-side and stamps the profile
- * with its service. Returns { service, member, roster }.
- */
-export async function redeemServiceCode(code, memberName) {
-  if (!supabase) throw new Error("Supabase is not configured");
-  const trimmed = (code || "").trim();
-  if (!trimmed) throw new Error("Enter your service access code");
-
-  let session = await getSession();
-  if (!session) {
-    const { data, error } = await supabase.auth.signInAnonymously();
-    if (error) throw friendlyAuthError(error);
-    session = data.session;
-  }
-
-  const { data, error } = await supabase.rpc("redeem_service_code", {
-    p_code: trimmed,
-    p_member_name: memberName ? String(memberName).trim() : null,
-  });
-
-  if (error) throw friendlyAuthError(error);
-
-  /* A wrong code comes back as a normal response with ok:false, not an
-     exception — the RPC has to commit its audit row, and raising would roll
-     that back. */
-  if (!data || data.ok === false) {
-    throw new Error("That access code was not recognised. Check with your service lead.");
-  }
-
-  if (data?.member?.display_name) setDeviceIdentity(data.member);
-  return data;
+/** The rotations a new user can choose from. */
+export async function fetchServices() {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from("services")
+    .select("id, name, hospital_id, hospital_name")
+    .eq("active", true)
+    .order("name");
+  if (error) throw error;
+  return data || [];
 }
 
-/* ── Admin: email + password ─────────────────── */
-
-export async function signInAdmin(email, password) {
+/**
+ * Join or switch rotation.
+ * Goes through an RPC rather than writing profiles.service_id directly —
+ * that column is deliberately not client-writable, because letting anyone
+ * point themselves at another service was a real escalation. The RPC
+ * validates the target and audits the change.
+ */
+export async function setMyService(serviceId) {
   if (!supabase) throw new Error("Supabase is not configured");
-  const { error } = await supabase.auth.signInWithPassword({
-    email: (email || "").trim().toLowerCase(),
-    password,
-  });
+  const { data, error } = await supabase.rpc("set_my_service", { p_service_id: serviceId });
   if (error) throw friendlyAuthError(error);
+  return data;
 }
 
 export async function signInWithGoogle() {
@@ -108,7 +81,7 @@ export async function fetchContext() {
 
   const { data: profile, error } = await supabase
     .from("profiles")
-    .select("id, role, service_id, member_id, full_name, email")
+    .select("id, role, service_id, member_id, full_name, email, blocked")
     .eq("id", session.user.id)
     .maybeSingle();
   if (error) throw error;
@@ -124,47 +97,24 @@ export async function fetchContext() {
     service = data ?? null;
   }
 
+  const meta = session.user.user_metadata || {};
   return {
     userId:      session.user.id,
-    isAnonymous: Boolean(session.user.is_anonymous),
+    blocked:     Boolean(profile.blocked),
     role:        profile.role || "collector",
-    isAdmin:     profile.role === "admin",
+    isAdmin:     profile.role === "admin" && !profile.blocked,
     serviceId:   profile.service_id,
     memberId:    profile.member_id,
-    displayName: profile.full_name || profile.email || deviceIdentity()?.display_name || "",
+    /* Google gives a real name; fall back to the address so nobody is
+       ever recorded as "unknown". */
+    displayName: profile.full_name || meta.full_name || meta.name || profile.email || session.user.email || "",
     email:       profile.email || session.user.email || null,
+    avatar:      meta.avatar_url || meta.picture || null,
     service,
-    /* An admin without a service, or a collector who has not redeemed a
-       code yet, cannot write — the RLS insert check requires a service. */
-    canCollect:  Boolean(profile.service_id),
+    /* No service picked yet, or blocked — either way the RLS insert check
+       will refuse, so the UI must not offer to collect. */
+    canCollect:  Boolean(profile.service_id) && !profile.blocked,
   };
-}
-
-export async function fetchRoster(serviceId) {
-  if (!supabase || !serviceId) return [];
-  const { data, error } = await supabase
-    .from("service_members")
-    .select("id, display_name, role")
-    .eq("service_id", serviceId)
-    .eq("active", true)
-    .order("display_name");
-  if (error) throw error;
-  return data || [];
-}
-
-/* ── Device identity (roster choice, remembered) ── */
-
-export function deviceIdentity() {
-  try { return JSON.parse(localStorage.getItem(DEVICE_KEY) || "null"); }
-  catch { return null; }
-}
-
-export function setDeviceIdentity(member) {
-  try { localStorage.setItem(DEVICE_KEY, JSON.stringify(member)); } catch { /* private mode */ }
-}
-
-export function clearDeviceIdentity() {
-  try { localStorage.removeItem(DEVICE_KEY); } catch { /* private mode */ }
 }
 
 /* ── Errors ──────────────────────────────────── */

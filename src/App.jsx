@@ -1,8 +1,8 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { motion, AnimatePresence, animate, useReducedMotion } from "framer-motion";
 import {
-  isSupabaseConfigured, redeemServiceCode, signInAdmin, signOut,
-  fetchContext, fetchRoster, onAuthChange, deviceIdentity, setDeviceIdentity, signInWithGoogle,
+  isSupabaseConfigured, signOut, fetchContext, onAuthChange,
+  signInWithGoogle, setMyService, fetchServices,
 } from "./lib/auth";
 import * as sync from "./lib/sync";
 import * as adminDb from "./lib/db";
@@ -1082,16 +1082,11 @@ export default function F2FApp(){
      once per device. Admins take the separate door below. */
   const [authReady,  setAuthReady]  = useState(!isSupabaseConfigured);
   const [ctx,        setCtx]        = useState(null);
-  const [gateStep,   setGateStep]   = useState("code");   // code | roster | admin
-  const [gateCode,   setGateCode]   = useState("");
-  const [gateName,   setGateName]   = useState(()=>deviceIdentity()?.display_name || "");
-  const [gateEmail,  setGateEmail]  = useState("");
-  const [gatePass,   setGatePass]   = useState("");
-  const [gateErr,    setGateErr]    = useState("");
-  const [gateBusy,   setGateBusy]   = useState(false);
-  const [roster,     setRoster]     = useState([]);
-  const [pendingSvc, setPendingSvc] = useState(null);
-  const [syncState,  setSyncState]  = useState(sync.status());
+  const [gateErr,     setGateErr]     = useState("");
+  const [gateBusy,    setGateBusy]    = useState(false);
+  const [serviceList, setServiceList] = useState([]);
+  const [recordScope, setRecordScope] = useState("mine");   // mine | service
+  const [syncState,   setSyncState]   = useState(sync.status());
 
   const refreshCtx = useCallback(async()=>{
     try{ setCtx(await fetchContext()); }
@@ -1120,33 +1115,18 @@ export default function F2FApp(){
   const [failedList, setFailedList] = useState([]);
   useEffect(()=>sync.onSyncChange(s=>{ setSyncState(s); setFailedList(sync.failedRecords()); }),[]);
 
-  const signedIn  = !isSupabaseConfigured || Boolean(ctx?.canCollect) || Boolean(ctx?.isAdmin);
-  const whoAmI    = ctx?.displayName || deviceIdentity()?.display_name || "";
+  const whoAmI    = ctx?.displayName || "";
   const serviceNm = ctx?.service?.name || "";
 
-  async function handleRedeem(){
-    setGateErr(""); setGateBusy(true);
-    try{
-      const res=await redeemServiceCode(gateCode, null);
-      setPendingSvc(res.service);
-      setRoster(res.roster||[]);
-      setGateStep("roster");
-    }catch(e){ setGateErr(e.message); }
-    finally{ setGateBusy(false); }
-  }
-
-  async function handleJoin(name){
-    const chosen=(name||gateName||"").trim();
-    if(chosen.length<2){ setGateErr("Enter your name so entries can be traced back to you."); return; }
-    setGateErr(""); setGateBusy(true);
-    try{
-      await redeemServiceCode(gateCode, chosen);
-      setDeviceIdentity({display_name:chosen});
-      await refreshCtx();
-      setGateCode("");
-    }catch(e){ setGateErr(e.message); }
-    finally{ setGateBusy(false); }
-  }
+  /* Rotations, for both the first-run picker and the Settings switcher. */
+  useEffect(()=>{
+    if(!isSupabaseConfigured||!ctx) return;
+    let alive=true;
+    fetchServices()
+      .then(list=>{ if(alive) setServiceList(list); })
+      .catch(e=>{ if(alive) setGateErr(e.message||"Could not load the service list"); });
+    return()=>{ alive=false; };
+  },[ctx?.userId, ctx?.serviceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleGoogle(){
     setGateErr(""); setGateBusy(true);
@@ -1154,18 +1134,19 @@ export default function F2FApp(){
     catch(e){ setGateErr(e.message); setGateBusy(false); }
   }
 
-  async function handleAdminSignIn(){
+  async function handlePickService(serviceId){
     setGateErr(""); setGateBusy(true);
-    try{ await signInAdmin(gateEmail,gatePass); await refreshCtx(); setGatePass(""); }
-    catch(e){ setGateErr(e.message); }
+    try{ await setMyService(serviceId); await refreshCtx(); }
+    catch(e){ setGateErr(e.message||"Could not join that service"); }
     finally{ setGateBusy(false); }
   }
 
   /* ── Admin monitoring ─────────────────────────── */
-  const [admTab,     setAdmTab]     = useState("entries");   // entries | issues | audit
+  const [admTab,     setAdmTab]     = useState("entries");   // entries | issues | users | audit
   const [admCases,   setAdmCases]   = useState([]);
   const [admOut,     setAdmOut]     = useState([]);
   const [admAudit,   setAdmAudit]   = useState([]);
+  const [admUsers,   setAdmUsers]   = useState([]);
   const [admServices,setAdmServices]= useState([]);
   const [admSvcId,   setAdmSvcId]   = useState("all");
   const [admQuery,   setAdmQuery]   = useState("");
@@ -1176,11 +1157,11 @@ export default function F2FApp(){
     if(!ctx?.isAdmin) return;
     setAdmBusy(true); setAdmErr("");
     try{
-      const [c,o,s,a]=await Promise.all([
+      const [c,o,s,a,u]=await Promise.all([
         adminDb.fetchAllAssessmentsAdmin(), adminDb.fetchAllOutcomesAdmin(),
-        adminDb.fetchServices(), adminDb.fetchAuditLog(300),
+        adminDb.fetchServices(), adminDb.fetchAuditLog(300), adminDb.fetchUsers(),
       ]);
-      setAdmCases(c); setAdmOut(o); setAdmServices(s); setAdmAudit(a);
+      setAdmCases(c); setAdmOut(o); setAdmServices(s); setAdmAudit(a); setAdmUsers(u);
     }catch(e){ setAdmErr(e.message||"Could not load monitoring data"); }
     finally{ setAdmBusy(false); }
   },[ctx]);
@@ -1218,6 +1199,18 @@ export default function F2FApp(){
     }catch(e){ setAdmErr(e.message||"Void failed"); }
   }
 
+  async function handleBlock(u){
+    const on=!u.blocked;
+    const ok=window.confirm(on
+      ? `Block ${u.email}?
+
+They will immediately lose all access — they cannot read or enter anything. Their existing entries are kept.`
+      : `Restore access for ${u.email}?`);
+    if(!ok) return;
+    try{ await adminDb.setUserBlocked(u.id,on); await loadAdmin(); }
+    catch(e){ setAdmErr(e.message||"Could not change that account"); }
+  }
+
   async function handleSignOut(){
     /* Sign-out wipes the local cache so a shared device leaks nothing — which
        would also destroy anything that never made it to the server. */
@@ -1232,7 +1225,7 @@ export default function F2FApp(){
     }
     await signOut();
     sync.clearLocalCache();
-    setCtx(null); setCases([]); setGateStep("code"); setGateName(""); setScreen("home");
+    setCtx(null); setCases([]); setServiceList([]); setGateErr(""); setScreen("home");
   }
 
   // Load persisted cases on mount
@@ -1910,9 +1903,17 @@ export default function F2FApp(){
   const renderRecords=()=>{
     const outcomes=fetchAllOutcomes();
     const outSet=new Set(outcomes.map(o=>o.studyId));
+
+    /* "Mine" is a view, not a boundary — the service is the real boundary, and
+       a patient must stay reachable when the resident who enrolled them is off
+       service. So this filters the same list rather than restricting it. */
+    const mine=c=>whoAmI&&c.enteredBy===whoAmI;
+    const mineCount=cases.filter(mine).length;
+    const shown=recordScope==="mine"?cases.filter(mine):cases;
+
     // Group by studyId
     const groups={};
-    cases.forEach(c=>{ (groups[c.studyId]=groups[c.studyId]||[]).push(c); });
+    shown.forEach(c=>{ (groups[c.studyId]=groups[c.studyId]||[]).push(c); });
     const groupList=Object.entries(groups).sort((a,b)=>{
       const al=Math.max(...a[1].map(c=>new Date(c.savedAt)));
       const bl=Math.max(...b[1].map(c=>new Date(c.savedAt)));
@@ -1926,15 +1927,36 @@ export default function F2FApp(){
         <div className="records-header">
           <div>
             <div className="display" style={{fontSize:24,marginBottom:2}}>Patient Records</div>
-            <div className="records-count">{cases.length} record{cases.length!==1?"s":""} · persistent · no PHI</div>
+            <div className="records-count">
+              {shown.length} record{shown.length!==1?"s":""}
+              {serviceNm?` · ${serviceNm}`:""} · no PHI
+            </div>
           </div>
           {cases.length>0&&<button className="export-btn" onClick={exportAllCSV}>Export CSV</button>}
         </div>
-        {cases.length===0&&(
+
+        {isSupabaseConfigured&&cases.length>0&&(
+          <div className="adm-filters" style={{marginBottom:14}}>
+            <button className={`adm-chip ${recordScope==="mine"?"on":""}`} onClick={()=>setRecordScope("mine")}>
+              My patients ({mineCount})
+            </button>
+            <button className={`adm-chip ${recordScope==="service"?"on":""}`} onClick={()=>setRecordScope("service")}>
+              Whole service ({cases.length})
+            </button>
+          </div>
+        )}
+
+        {shown.length===0&&(
           <div className="empty-state">
             <div className="empty-icon">📋</div>
-            <div className="empty-text">No records yet</div>
-            <div className="empty-sub">Complete a patient assessment to see it here</div>
+            <div className="empty-text">
+              {recordScope==="mine"&&cases.length>0?"You have not entered any patients yet":"No records yet"}
+            </div>
+            <div className="empty-sub">
+              {recordScope==="mine"&&cases.length>0
+                ? <>Your service has {cases.length} — <button className="gate-link" style={{fontSize:12,padding:0}} onClick={()=>setRecordScope("service")}>show the whole service</button></>
+                : "Complete a patient assessment to see it here"}
+            </div>
           </div>
         )}
         {groupList.map(([sid,sCases])=>{
@@ -2161,10 +2183,25 @@ export default function F2FApp(){
             <div className="settings-label">Signed in</div>
             <div className="settings-note" style={{marginBottom:12}}>
               <strong style={{color:"var(--k)"}}>{whoAmI||"Unnamed"}</strong>
+              {ctx.email&&<><br/><span style={{fontFamily:"var(--mono)",fontSize:11}}>{ctx.email}</span></>}
               {serviceNm&&<><br/>{serviceNm}</>}
               {ctx.service?.hospital_name&&<><br/>{ctx.service.hospital_name}</>}
               {ctx.isAdmin&&<><br/><span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--r)",fontWeight:700}}>ADMINISTRATOR</span></>}
             </div>
+
+            {/* Residents rotate, so changing service has to be self-service. */}
+            <div className="settings-label" style={{marginTop:16}}>Rotation</div>
+            <div className="settings-note" style={{marginBottom:10}}>
+              Change this when you move service. Your existing entries stay where they were recorded.
+            </div>
+            <div className="adm-filters" style={{marginBottom:12}}>
+              {serviceList.map(s=>(
+                <button key={s.id} className={`adm-chip ${ctx.serviceId===s.id?"on":""}`}
+                  disabled={gateBusy||ctx.serviceId===s.id}
+                  onClick={()=>handlePickService(s.id)}>{s.name}</button>
+              ))}
+            </div>
+            {gateErr&&<div className="gate-err" style={{marginBottom:10}}>{gateErr}</div>}
             <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:12}}>
               {syncState.failed>0
                 ? <span style={{color:"var(--r)",fontWeight:700}}>
@@ -2290,7 +2327,8 @@ export default function F2FApp(){
         </div>
 
         <div className="adm-tabs">
-          {[["entries",`Entries (${visible.length})`],["issues",`Issues (${issues.length})`],["audit","Audit trail"]].map(([id,lbl])=>(
+          {[["entries",`Entries (${visible.length})`],["issues",`Issues (${issues.length})`],
+            ["users",`Users (${admUsers.length})`],["audit","Audit trail"]].map(([id,lbl])=>(
             <button key={id} className={`adm-tab ${admTab===id?"on":""}`} onClick={()=>setAdmTab(id)}>{lbl}</button>
           ))}
         </div>
@@ -2368,6 +2406,53 @@ export default function F2FApp(){
               ))
         )}
 
+        {!admBusy&&admTab==="users"&&(
+          <>
+            <div style={{fontSize:11.5,color:"var(--k4)",lineHeight:1.6,marginBottom:14}}>
+              Anyone with a Google account can sign in and enter data. Blocking an
+              account revokes read and write immediately; its existing entries are
+              kept and stay attributed, so nothing is lost from the study.
+            </div>
+            {admUsers.length===0
+              ? <div className="empty-state"><div className="empty-text">Nobody has signed in yet</div></div>
+              : (
+                <div className="adm-scroll">
+                  <table className="adm-table">
+                    <thead><tr>
+                      <th>Account</th><th>Service</th><th>Role</th><th>Entries</th><th>Last active</th><th/>
+                    </tr></thead>
+                    <tbody>
+                      {admUsers.map(u=>(
+                        <tr key={u.id} className={u.blocked?"voided":""}>
+                          <td>
+                            <div>{u.full_name||"—"}</div>
+                            <div className="adm-mono" style={{color:"var(--k4)"}}>{u.email}</div>
+                          </td>
+                          <td>{u.service_name||<span style={{color:"var(--k4)"}}>none yet</span>}</td>
+                          <td>
+                            {u.role==="admin"
+                              ? <span className="adm-flagpill warn">admin</span>
+                              : <span style={{color:"var(--k4)"}}>collector</span>}
+                            {u.blocked&&<span className="adm-flagpill">blocked</span>}
+                          </td>
+                          <td className="adm-mono">{u.entries ?? 0}</td>
+                          <td className="adm-mono">{u.last_seen?String(u.last_seen).slice(0,10):"—"}</td>
+                          <td>
+                            {u.id!==ctx?.userId&&u.role!=="admin"&&(
+                              <button className="adm-void" onClick={()=>handleBlock(u)}>
+                                {u.blocked?"Unblock":"Block"}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+          </>
+        )}
+
         {!admBusy&&admTab==="audit"&&(
           admAudit.length===0
             ? <div className="empty-state"><div className="empty-text">No activity yet</div></div>
@@ -2391,17 +2476,17 @@ export default function F2FApp(){
   };
 
   /* ═══════════════════════════════════════════════
-     ACCESS GATE
-     One code, then one name. No email, no password, no reset
-     loop — those are what keep residents out of the database
-     and in a spreadsheet.
+     SIGN IN
+     One door: Google. The Gmail account is the identity, so a
+     resident's patients follow them to any device. First sign-in
+     ends on "which service are you on?" — after that, straight through.
   ═══════════════════════════════════════════════ */
   const fade=(d=0)=>({
     initial:reduce?false:{opacity:0,y:10}, animate:{opacity:1,y:0},
     transition:{duration:0.4,delay:d,ease:[0.22,0.61,0.36,1]},
   });
 
-  const renderGate=()=>(
+  const gateShell=(children)=>(
     <div className="gate">
       <motion.div className="gate-hero" {...fade(0)}>
         <div className="gate-brand">Fitness-to-Flap</div>
@@ -2409,118 +2494,7 @@ export default function F2FApp(){
           Pre-operative risk stratification<br/>Pressure Injury Module · v1.1
         </div>
       </motion.div>
-
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.div key={gateStep}
-          initial={reduce?{opacity:0}:{opacity:0,x:20}}
-          animate={{opacity:1,x:0}}
-          exit={reduce?{opacity:0}:{opacity:0,x:-20}}
-          transition={{duration:reduce?0.12:0.28,ease:[0.22,0.61,0.36,1]}}>
-
-          {gateStep==="code"&&(
-            <div>
-              <div className="gate-label">Service access code</div>
-              <input className="gate-input" value={gateCode} autoFocus
-                autoCapitalize="characters" autoCorrect="off" spellCheck={false}
-                placeholder="CASTRELLON-26"
-                onChange={e=>{setGateCode(e.target.value);setGateErr("");}}
-                onKeyDown={e=>{if(e.key==="Enter"&&gateCode.trim())handleRedeem();}}/>
-              {gateErr&&<div className="gate-err">{gateErr}</div>}
-              <button className="btn-p" style={{marginTop:14}}
-                disabled={gateBusy||!gateCode.trim()} onClick={handleRedeem}>
-                {gateBusy?"Checking…":"Continue →"}
-              </button>
-              <div className="gate-foot">
-                <button className="gate-link" onClick={()=>{setGateStep("admin");setGateErr("");}}>
-                  Attending / admin login →
-                </button>
-              </div>
-              <div className="gate-note">
-                Your service lead has the code for this rotation.<br/>
-                You only need to do this once on this device.
-              </div>
-            </div>
-          )}
-
-          {gateStep==="roster"&&(
-            <div>
-              <div className="gate-service">
-                <strong>{pendingSvc?.name}</strong>
-                {pendingSvc?.hospital_name&&<><br/>{pendingSvc.hospital_name}</>}
-              </div>
-              <div className="gate-label">Who are you?</div>
-              {roster.map(m=>(
-                <button key={m.id} className="roster-btn" disabled={gateBusy}
-                  onClick={()=>{setGateName(m.display_name);handleJoin(m.display_name);}}>
-                  <span className="roster-radio"/>
-                  <span className="roster-text">
-                    <span className="roster-name">{m.display_name}</span>
-                    <span className="roster-role">{m.role}</span>
-                  </span>
-                </button>
-              ))}
-              <div className="gate-label" style={{marginTop:18}}>
-                {roster.length>0?"Not listed? Add yourself":"Enter your name"}
-              </div>
-              <input className="gate-input plain" value={gateName}
-                placeholder="Dr. Castrellon  ·  R. Patel"
-                onChange={e=>{setGateName(e.target.value);setGateErr("");}}
-                onKeyDown={e=>{if(e.key==="Enter")handleJoin();}}/>
-              {gateErr&&<div className="gate-err">{gateErr}</div>}
-              <button className="btn-p" style={{marginTop:14}}
-                disabled={gateBusy||gateName.trim().length<2} onClick={()=>handleJoin()}>
-                {gateBusy?"Joining…":"Start →"}
-              </button>
-              <div className="gate-foot">
-                <button className="gate-link" onClick={()=>{setGateStep("code");setGateErr("");}}>
-                  ← Different service
-                </button>
-              </div>
-              <div className="gate-note">
-                Your name is stamped on every entry you make. It is not a
-                password — it is what lets an error be traced and corrected.
-              </div>
-            </div>
-          )}
-
-          {gateStep==="admin"&&(
-            <div>
-              {/* Every existing account was created through Google and has no
-                  password, so this has to come first — an email/password-only
-                  screen would lock every current admin out. */}
-              <button className="google-btn" disabled={gateBusy} onClick={handleGoogle}>
-                <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">
-                  <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-2.8-.4-4H24v7.3h12.1c-.2 2-1.6 5-4.5 7l-.1.3 6.5 5 .5.1c4.1-3.8 6.6-9.4 6.6-15.7"/>
-                  <path fill="#34A853" d="M24 46c5.9 0 10.9-1.9 14.5-5.3l-6.9-5.4c-1.8 1.3-4.3 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.1l-.3v.1l-6.7 5.2-.1.3C8 41.1 15.4 46 24 46"/>
-                  <path fill="#FBBC05" d="M11.5 28.4c-.5-1.4-.8-2.9-.8-4.4s.3-3 .7-4.4v-.3l-6.8-5.3-.2.1C2.9 17 2 20.4 2 24s.9 7 2.4 10.1z"/>
-                  <path fill="#EB4335" d="M24 10.7c4.1 0 6.9 1.8 8.5 3.3l6.2-6C34.9 4.5 29.9 2 24 2 15.4 2 8 6.9 4.4 13.9l7 5.5c1.8-5.3 6.8-8.7 12.6-8.7"/>
-                </svg>
-                Continue with Google
-              </button>
-              <div className="auth-divider">or</div>
-              <div className="gate-label">Email</div>
-              <input className="gate-input plain" type="email" value={gateEmail} autoFocus
-                autoCapitalize="off" autoCorrect="off" spellCheck={false}
-                onChange={e=>{setGateEmail(e.target.value);setGateErr("");}}/>
-              <div className="gate-label" style={{marginTop:14}}>Password</div>
-              <input className="gate-input plain" type="password" value={gatePass}
-                onChange={e=>{setGatePass(e.target.value);setGateErr("");}}
-                onKeyDown={e=>{if(e.key==="Enter")handleAdminSignIn();}}/>
-              {gateErr&&<div className="gate-err">{gateErr}</div>}
-              <button className="btn-p" style={{marginTop:14}}
-                disabled={gateBusy||!gateEmail.trim()||!gatePass} onClick={handleAdminSignIn}>
-                {gateBusy?"Signing in…":"Sign in →"}
-              </button>
-              <div className="gate-foot">
-                <button className="gate-link" onClick={()=>{setGateStep("code");setGateErr("");}}>
-                  ← Use a service code instead
-                </button>
-              </div>
-            </div>
-          )}
-        </motion.div>
-      </AnimatePresence>
-
+      <motion.div {...fade(0.08)}>{children}</motion.div>
       <div className="gate-note" style={{marginTop:28}}>
         De-identified by design · Study IDs only, no PHI<br/>
         Research &amp; educational use only
@@ -2528,37 +2502,71 @@ export default function F2FApp(){
     </div>
   );
 
-  if(!authReady) return(<><style>{css}</style><div className="boot"><div className="boot-mark">F2F</div></div></>);
-
-  /* Signed in with a real account, but neither on the admin allowlist nor
-     attached to a service. Without this they would land back on the code
-     screen with no explanation and no way out. */
-  if(isSupabaseConfigured && ctx && !ctx.isAdmin && !ctx.canCollect && !ctx.isAnonymous) return(
-    <>
-      <style>{css}</style>
-      <div className="gate">
-        <motion.div className="gate-hero" {...fade(0)}>
-          <div className="gate-brand">Fitness-to-Flap</div>
-        </motion.div>
-        <motion.div {...fade(0.08)}>
-          <div className="alert al-red" style={{marginBottom:20}}>
-            <div className="al-title" style={{color:"var(--r)"}}>Not authorised</div>
-            <div className="al-body">
-              <strong>{ctx.email}</strong> is not an approved administrator account.
-              Administrator access is limited to named research accounts.
-            </div>
-          </div>
-          <div className="gate-note" style={{marginTop:0,marginBottom:20}}>
-            If you are here to record assessments, sign out and enter your
-            service access code instead.
-          </div>
-          <button className="btn-p" onClick={handleSignOut}>Sign out</button>
-        </motion.div>
+  const renderSignIn=()=>gateShell(
+    <div>
+      <button className="google-btn" disabled={gateBusy} onClick={handleGoogle}>
+        <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">
+          <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-2.8-.4-4H24v7.3h12.1c-.2 2-1.6 5-4.5 7l-.1.3 6.5 5 .5.1c4.1-3.8 6.6-9.4 6.6-15.7"/>
+          <path fill="#34A853" d="M24 46c5.9 0 10.9-1.9 14.5-5.3l-6.9-5.4c-1.8 1.3-4.3 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.1l-.3v.1l-6.7 5.2-.1.3C8 41.1 15.4 46 24 46"/>
+          <path fill="#FBBC05" d="M11.5 28.4c-.5-1.4-.8-2.9-.8-4.4s.3-3 .7-4.4v-.3l-6.8-5.3-.2.1C2.9 17 2 20.4 2 24s.9 7 2.4 10.1z"/>
+          <path fill="#EB4335" d="M24 10.7c4.1 0 6.9 1.8 8.5 3.3l6.2-6C34.9 4.5 29.9 2 24 2 15.4 2 8 6.9 4.4 13.9l7 5.5c1.8-5.3 6.8-8.7 12.6-8.7"/>
+        </svg>
+        {gateBusy?"Opening Google…":"Sign in with Google"}
+      </button>
+      {gateErr&&<div className="gate-err">{gateErr}</div>}
+      <div className="gate-note">
+        Use your Gmail account. Your patients stay with your account, so you can
+        pick up any device and carry on.
       </div>
-    </>
+    </div>
   );
 
-  if(!signedIn)  return(<><style>{css}</style>{renderGate()}</>);
+  const renderPickService=()=>gateShell(
+    <div>
+      <div className="gate-service">Signed in as <strong>{ctx?.email}</strong></div>
+      <div className="gate-label">Which service are you on?</div>
+      {serviceList.length===0
+        ? <div className="gate-note" style={{marginTop:0}}>Loading rotations…</div>
+        : serviceList.map(s=>(
+            <button key={s.id} className="roster-btn" disabled={gateBusy}
+              onClick={()=>handlePickService(s.id)}>
+              <span className="roster-radio"/>
+              <span className="roster-text">
+                <span className="roster-name">{s.name}</span>
+                <span className="roster-role">{s.hospital_name||s.hospital_id||""}</span>
+              </span>
+            </button>
+          ))}
+      {gateErr&&<div className="gate-err">{gateErr}</div>}
+      <div className="gate-note">
+        Everyone on a service shares its patients, so you can continue a colleague's
+        patient and they can continue yours. You can change rotation later in Settings.
+      </div>
+      <div className="gate-foot">
+        <button className="gate-link" onClick={handleSignOut}>Sign out</button>
+      </div>
+    </div>
+  );
+
+  const renderBlocked=()=>gateShell(
+    <div>
+      <div className="alert al-red" style={{marginBottom:20}}>
+        <div className="al-title" style={{color:"var(--r)"}}>Access removed</div>
+        <div className="al-body">
+          <strong>{ctx?.email}</strong> has been blocked from this study by an
+          administrator. Contact the research team if you think this is a mistake.
+        </div>
+      </div>
+      <button className="btn-p" onClick={handleSignOut}>Sign out</button>
+    </div>
+  );
+
+  if(!authReady) return(<><style>{css}</style><div className="boot"><div className="boot-mark">F2F</div></div></>);
+  if(isSupabaseConfigured&&!ctx)         return(<><style>{css}</style>{renderSignIn()}</>);
+  if(isSupabaseConfigured&&ctx.blocked)  return(<><style>{css}</style>{renderBlocked()}</>);
+  /* Admins have oversight without belonging to a rotation, so only collectors
+     are held here until they pick one. */
+  if(isSupabaseConfigured&&!ctx.serviceId&&!ctx.isAdmin) return(<><style>{css}</style>{renderPickService()}</>);
 
   return(
     <>

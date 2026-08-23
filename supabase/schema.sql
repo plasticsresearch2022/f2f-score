@@ -5,17 +5,29 @@
 -- De-identified by design: Study IDs only, NO PHI.
 --
 -- Design notes:
---  * Collectors sign in ANONYMOUSLY and redeem a service access code.
---    No email, no password reset, no deliverability dependency — that is
---    the whole point, because friction is what stops residents using this.
+--  * Everyone signs in with GOOGLE. The Gmail account is the identity, so a
+--    resident's patients follow them across devices. On first sign-in they
+--    pick their surgical service; they can switch when they rotate.
+--  * Sign-in is deliberately OPEN — anyone with a Google account can enter
+--    data. Every row records who wrote it and everything lands in audit_log,
+--    and an admin can block an account, which revokes read and write at once.
+--  * Visibility is per SERVICE, not per person: a patient's record spans
+--    months and residents rotate, so anyone on the service must be able to
+--    continue anyone's patient. "My Patients" in the app is a filter over
+--    this, never a security boundary.
+--  * Admin is granted only to admin_allowlist, enforced by trigger.
 --  * Nothing is ever updated or deleted. Corrections insert a new row
 --    that supersedes the old one; voiding is an admin-only RPC. There is
 --    deliberately no UPDATE or DELETE policy on the data tables, so
 --    Postgres refuses rather than the app trusting itself.
 --  * This file is idempotent — safe to re-run.
 --
--- PREREQUISITE: enable Anonymous sign-ins in
---   Dashboard → Authentication → Sign In / Providers → Anonymous
+-- PREREQUISITE: the Google OAuth consent screen must be PUBLISHED in GCP.
+--   While it is in testing mode only hand-added test users can sign in, which
+--   with Google as the only door means nobody can.
+--
+-- Access codes (redeem_service_code, services.access_code_hash) are retained
+-- but unused — they are the fallback for a site without Google access.
 -- ═══════════════════════════════════════════════
 
 create extension if not exists pgcrypto with schema extensions;
@@ -31,7 +43,7 @@ create table if not exists public.services (
   slug             text not null unique,         -- "castrellon"
   hospital_id      text,                         -- LCH / PGH / DMC / NLN / OTH
   hospital_name    text,
-  access_code_hash text not null,                -- bcrypt; never store the plaintext
+  access_code_hash text,                        -- bcrypt; null since Google sign-in replaced codes
   active           boolean not null default true,
   created_at       timestamptz not null default now()
 );
@@ -46,6 +58,8 @@ create table if not exists public.service_members (
   created_at   timestamptz not null default now(),
   unique (service_id, display_name)
 );
+
+alter table public.services alter column access_code_hash drop not null;
 
 create index if not exists service_members_service_idx
   on public.service_members (service_id) where active;
@@ -64,6 +78,11 @@ create table if not exists public.profiles (
 alter table public.profiles add column if not exists role       text not null default 'collector'; -- collector | admin
 alter table public.profiles add column if not exists service_id uuid references public.services on delete set null;
 alter table public.profiles add column if not exists member_id  uuid references public.service_members on delete set null;
+-- Sign-in is open, so the ability to revoke someone matters more than the
+-- ability to stop them arriving. Enforced inside current_service_id() and
+-- is_admin(), which every RLS policy already keys off — so one flag closes
+-- every door at once.
+alter table public.profiles add column if not exists blocked    boolean not null default false;
 
 -- ═══════════════════════════════════════════════
 -- 3. ASSESSMENTS — extends the v1 table
@@ -217,14 +236,18 @@ create policy allowlist_admin_read on public.admin_allowlist for select
 -- SECURITY DEFINER so they bypass RLS internally — without that,
 -- a profiles policy calling is_admin() would recurse forever.
 -- ═══════════════════════════════════════════════
+-- Both return "nothing" for a blocked user. Because every policy is written in
+-- terms of these two, blocking someone revokes read and write everywhere
+-- without editing a single policy.
 create or replace function public.current_service_id()
 returns uuid language sql stable security definer set search_path = public as $$
-  select service_id from public.profiles where id = auth.uid();
+  select case when blocked then null else service_id end
+    from public.profiles where id = auth.uid();
 $$;
 
 create or replace function public.is_admin()
 returns boolean language sql stable security definer set search_path = public as $$
-  select coalesce((select role = 'admin' from public.profiles where id = auth.uid()), false);
+  select coalesce((select role = 'admin' and not blocked from public.profiles where id = auth.uid()), false);
 $$;
 
 create or replace function public.actor_label()
@@ -423,6 +446,94 @@ begin
           jsonb_build_object('reason', trim(p_reason)));
 end; $$;
 
+-- Choose or change your own rotation.
+--
+-- Deliberately an RPC rather than a column grant: profiles.service_id stays
+-- unwritable by the client, because that grant is what closed the escalation
+-- where anyone could point themselves at another service. Routing it through
+-- here means the target is validated and every switch is auditable.
+create or replace function public.set_my_service(p_service_id uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_service public.services%rowtype; v_prev uuid; v_blocked boolean;
+begin
+  if auth.uid() is null then
+    raise exception 'not authenticated' using errcode = '28000';
+  end if;
+
+  select service_id, blocked into v_prev, v_blocked from public.profiles where id = auth.uid();
+  if v_blocked then
+    raise exception 'this account has been blocked' using errcode = '42501';
+  end if;
+
+  select * into v_service from public.services where id = p_service_id and active;
+  if not found then
+    raise exception 'unknown service' using errcode = '22023';
+  end if;
+
+  update public.profiles set service_id = v_service.id where id = auth.uid();
+
+  -- Attach the person to the service roster so their name appears in reports
+  -- alongside those who joined by code.
+  insert into public.service_members (service_id, display_name)
+  select v_service.id, coalesce(nullif(trim(p.full_name), ''), p.email, 'Unnamed')
+    from public.profiles p where p.id = auth.uid()
+  on conflict (service_id, display_name) do update set active = true;
+
+  update public.profiles p
+     set member_id = sm.id
+    from public.service_members sm
+   where p.id = auth.uid() and sm.service_id = v_service.id
+     and sm.display_name = coalesce(nullif(trim(p.full_name), ''), p.email, 'Unnamed');
+
+  insert into public.audit_log (actor_user_id, actor_name, service_id, action, detail)
+  values (auth.uid(), public.actor_label(), v_service.id,
+          case when v_prev is null then 'join_service' else 'switch_service' end,
+          jsonb_build_object('from', v_prev, 'to', v_service.id, 'service', v_service.name));
+
+  return jsonb_build_object('ok', true, 'service',
+    jsonb_build_object('id', v_service.id, 'name', v_service.name, 'slug', v_service.slug,
+                       'hospital_id', v_service.hospital_id, 'hospital_name', v_service.hospital_name));
+end; $$;
+
+-- Admin-only block / unblock. One flag revokes read and write everywhere.
+create or replace function public.set_user_blocked(p_user_id uuid, p_blocked boolean)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin() then
+    raise exception 'admin only' using errcode = '42501';
+  end if;
+  if p_user_id = auth.uid() then
+    raise exception 'you cannot block yourself' using errcode = '22023';
+  end if;
+  if p_blocked and exists (
+       select 1 from public.profiles p join auth.users u on u.id = p.id
+        where p.id = p_user_id
+          and exists (select 1 from public.admin_allowlist a where lower(a.email) = lower(u.email))) then
+    raise exception 'allowlisted administrators cannot be blocked' using errcode = '22023';
+  end if;
+
+  update public.profiles set blocked = p_blocked where id = p_user_id;
+
+  insert into public.audit_log (actor_user_id, actor_name, action, entity, entity_id, detail)
+  values (auth.uid(), public.actor_label(), case when p_blocked then 'block_user' else 'unblock_user' end,
+          'profile', p_user_id, jsonb_build_object('blocked', p_blocked));
+end; $$;
+
+-- Everyone who has ever signed in, for the admin Users tab.
+create or replace function public.list_users()
+returns table (id uuid, email text, full_name text, role text, blocked boolean,
+               service_id uuid, service_name text, entries bigint, last_seen timestamptz)
+language sql stable security definer set search_path = public as $$
+  select p.id, u.email, p.full_name, p.role, p.blocked, p.service_id, s.name,
+         (select count(*) from public.assessments a where a.user_id = p.id),
+         greatest(u.last_sign_in_at, (select max(a.created_at) from public.assessments a where a.user_id = p.id))
+    from public.profiles p
+    join auth.users u on u.id = p.id
+    left join public.services s on s.id = p.service_id
+   where public.is_admin()
+   order by p.blocked, u.email;
+$$;
+
 -- Record that someone pulled the dataset. Of everything worth having a trail
 -- for in IRB research, "who took a copy of the data" is near the top, and the
 -- insert triggers only cover rows being created.
@@ -476,11 +587,12 @@ alter table public.assessments     enable row level security;
 alter table public.outcomes        enable row level security;
 alter table public.audit_log       enable row level security;
 
--- services: you can see your own service; admins see all. Never the hash —
--- the client reads services through the redeem RPC and the view below.
+-- services: any signed-in user can list them, because the sign-in flow now ends
+-- in "which service are you on?" and the picker has to show the options. Only
+-- the name and hospital are granted at the column level — never the hash.
 drop policy if exists services_read on public.services;
 create policy services_read on public.services for select
-  using (public.is_admin() or id = public.current_service_id());
+  using (auth.uid() is not null);
 
 drop policy if exists services_admin_write on public.services;
 create policy services_admin_write on public.services for all
@@ -552,6 +664,9 @@ grant select on public.assessments_current, public.outcomes_current to authentic
 grant execute on function public.redeem_service_code(text, text) to authenticated;
 grant execute on function public.void_assessment(uuid, text)      to authenticated;
 grant execute on function public.log_export(text, int)            to authenticated;
+grant execute on function public.set_my_service(uuid)             to authenticated;
+grant execute on function public.set_user_blocked(uuid, boolean)  to authenticated;
+grant execute on function public.list_users()                     to authenticated;
 grant execute on function public.void_outcome(uuid, text)         to authenticated;
 grant execute on function public.create_service(text, text, text, text, text) to authenticated;
 

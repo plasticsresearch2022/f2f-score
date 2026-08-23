@@ -207,3 +207,20 @@ export async function logExport(kind, rowCount) {
     console.warn("[F2F] export audit failed:", e?.message);
   }
 }
+
+/* ── Users (admin) ───────────────────────────── */
+
+/** Everyone who has ever signed in. RLS-equivalent check lives in the RPC. */
+export async function fetchUsers() {
+  if (!supabase) return [];
+  const { data, error } = await supabase.rpc("list_users");
+  if (error) throw error;
+  return data || [];
+}
+
+/** Block or unblock an account. One flag revokes read and write everywhere. */
+export async function setUserBlocked(userId, blocked) {
+  if (!supabase) throw new Error("Supabase is not configured");
+  const { error } = await supabase.rpc("set_user_blocked", { p_user_id: userId, p_blocked: blocked });
+  if (error) throw error;
+}
