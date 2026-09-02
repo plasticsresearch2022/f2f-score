@@ -3,6 +3,29 @@
   "version": "1.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "verify:clinical": "node scripts/verify-clinical-parity.mjs",
+    "smoke": "node scripts/smoke-render.mjs",
+    "test:integrity": "node scripts/test-integrity.mjs",
+    "check": "npm run verify:clinical && npm run smoke && npm run test:integrity && npm run test:sync && npm run test:workbook && npm run build",
+    "test:workbook": "node scripts/test-workbook.mjs",
+    "build:template": "node scripts/build-workbook-template.mjs",
+    "test:sync": "node scripts/test-sync.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
+    "fflate": "^0.8.3",
+    "framer-motion": "^12.40.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite": "^5.0.0"
+  }
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "react": "^18.2.0", "react-dom": "^18.2.0" },
   "devDependencies": { "@vitejs/plugin-react": "^4.2.0", "vite": "^5.0.0" }

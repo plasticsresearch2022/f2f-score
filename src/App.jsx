@@ -1,4 +1,11 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
+import { motion, AnimatePresence, animate, useReducedMotion } from "framer-motion";
+import {
+  isSupabaseConfigured, signOut, fetchContext, onAuthChange,
+  signInWithGoogle, setMyService, fetchServices,
+} from "./lib/auth";
+import * as sync from "./lib/sync";
+import * as adminDb from "./lib/db";
 
 /* ═══════════════════════════════════════════════
    F2F Score — Vercel production build
@@ -23,18 +30,71 @@ function lsKeys(p){ try{return Object.keys(localStorage).filter(k=>k.startsWith(
 function persistCase(data){
   const key=`f2f_case_${data.studyId}_${Date.now()}`;
   lsSet(key,JSON.stringify(data));
+  sync.enqueue("case", key);   // ← local write is the commit; the cloud catches up
 }
 function fetchAllCases(){
   return lsKeys("f2f_case_").map(k=>{try{return JSON.parse(lsGet(k));}catch(e){return null;}})
     .filter(Boolean).sort((a,b)=>new Date(b.savedAt)-new Date(a.savedAt));
 }
 function persistOutcome(studyId, data){
+  const key=`f2f_outcome_${studyId}`;
+  lsSet(key, JSON.stringify(data));
+  sync.enqueue("outcome", key);
   lsSet(`f2f_outcome_${studyId}`, JSON.stringify(data));
 }
 function fetchOutcome(studyId){
   const r=lsGet(`f2f_outcome_${studyId}`);
   if(!r) return null;
   try{return JSON.parse(r);}catch(e){return null;}
+}
+function fetchAllOutcomes(){
+  return lsKeys("f2f_outcome_").map(k=>{try{return JSON.parse(lsGet(k));}catch(e){return null;}}).filter(Boolean);
+}
+function knownStudyIds(){
+  const ids=new Set();
+  fetchAllCases().forEach(c=>ids.add(c.studyId));
+  return Array.from(ids).sort();
+}
+
+/* ═══════════════════════════════════════════════
+   30-DAY OUTCOME FIELDS (blinded entry)
+═══════════════════════════════════════════════ */
+const OUTCOME_FIELDS = [
+  { id:"cfl",  label:"Complete flap failure",                       hint:"Total or near-total (>75%) flap necrosis requiring debridement or reoperation" },
+  { id:"pfl",  label:"Partial flap failure",                        hint:"Loss of >25% flap surface area requiring unplanned return to OR" },
+  { id:"ssi",  label:"Deep surgical site infection",                hint:"Deep soft tissue/fascia/muscle, culture-confirmed, requiring surgical intervention" },
+  { id:"hem",  label:"Hematoma or seroma requiring evacuation",     hint:"Requiring operative evacuation" },
+  { id:"deh",  label:"Major wound dehiscence",                      hint:"Full-thickness ≥2cm or fascial-level, requiring operative intervention" },
+  { id:"ana",  label:"Free flap anastomotic failure",              hint:"Requiring revision or flap takedown (microsurgical cases only)" },
+  { id:"mort", label:"30-day mortality",                            hint:"All-cause mortality within 30 days" },
+];
+
+/* ═══════════════════════════════════════════════
+   CLAVIEN-DINDO — DERIVED FROM MANAGEMENT LEVEL
+   Residents answer what the complication required;
+   the grade is computed, not judged by hand.
+═══════════════════════════════════════════════ */
+const CD_OPTIONS = [
+  { id:"none",  label:"No complication occurred",
+    detail:"Uncomplicated 30-day course",                                          grade:"None" },
+  { id:"g1",    label:"Managed at bedside only — no added medications",
+    detail:"Wound care, dressing changes, observation (Grade I)",                  grade:"I" },
+  { id:"g2",    label:"Required medication — antibiotics, transfusion, or TPN",
+    detail:"Pharmacologic treatment beyond routine (Grade II)",                    grade:"II" },
+  { id:"g3a",   label:"Required a procedure WITHOUT general anesthesia",
+    detail:"Bedside I&D, aspiration, local intervention (Grade IIIa)",             grade:"IIIa" },
+  { id:"g3b",   label:"Required return to OR under general anesthesia",
+    detail:"Reoperation, operative debridement, flap revision (Grade IIIb)",       grade:"IIIb" },
+  { id:"g4a",   label:"Required ICU management — single organ support",
+    detail:"Single-organ dysfunction, ICU-level care (Grade IVa)",                 grade:"IVa" },
+  { id:"g4b",   label:"Required ICU management — multi-organ support",
+    detail:"Multi-organ dysfunction (Grade IVb)",                                  grade:"IVb" },
+  { id:"g5",    label:"Patient died within 30 days",
+    detail:"30-day mortality (Grade V)",                                           grade:"V" },
+];
+function cdGradeFromOption(id){ return CD_OPTIONS.find(o=>o.id===id)?.grade || ""; }
+
+/* ═══════════════════════════════════════════════
 }
 function fetchAllOutcomes(){
   return lsKeys("f2f_outcome_").map(k=>{try{return JSON.parse(lsGet(k));}catch(e){return null;}}).filter(Boolean);
@@ -151,6 +211,298 @@ function buildFullCSV(cases, outcomes) {
       o?o.clavienDindo:"",o?o.notes:"",o?o.recordedAt:""];
   });
   return [H,...rows].map(r=>r.map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",")).join("\n");
+}
+
+/* ═══════════════════════════════════════════════
+   ADMIN EXPORT
+
+   Wraps Pedro's buildFullCSV rather than reimplementing it, so his
+   columns stay byte-compatible with the sheet the study already uses.
+   Provenance columns are appended after them.
+
+   Notes are the one free-text field, so newlines are flattened
+   before the wrapped call — a literal newline inside a quoted cell
+   would break the line-wise append below (and most spreadsheet
+   importers along with it).
+═══════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════
+   RESEARCH EXPORT — Pedro's master workbook layout
+
+   His sheet is one row per PATIENT with the scores pivoted into
+   columns; the app stores one row per ASSESSMENT. This pivots back
+   so an export drops straight into the workbook he already uses.
+
+   Two header rows, because his top row is merged group labels.
+   Strings below are copied byte-for-byte from the real file,
+   trailing spaces and all ("Surgery  ", "LOS since enrollment
+   (days) ") — a test asserts they still match.
+
+   Columns the app cannot fill, and why:
+     Hospital Account #, DOB   PHI. Deliberately never stored — they
+                               live in the offline de-identification
+                               log. Blank here by design.
+     Age at enrollment, Sex    Not identifiers, but the app has no
+                               field for them yet.
+   Everything else comes from the database.
+═══════════════════════════════════════════════ */
+const RESEARCH_HEADER_1 = [
+  "Study ID","Hospital Account #","DOB","Age at enrollment","Sex",
+  "Scores Dates","","","","","Optimization Duration (days)",
+  "Surgery  ","","PRIMARY OUTCOMES — 30 DAYS","","","","","","","",
+  "SECONDARY OUTCOMES","","","","","","","Administrative","","",
+];
+const RESEARCH_HEADER_2 = [
+  "","","","","","First F2F score","","Reassesment","Preoperative F2F score","","",
+  "Debridements #","Type of flap",
+  "Complete Flap Failure (>75% loss)","Partial Flap Failure (>25% flap loss)",
+  "Deep SSI","Hematoma/Seroma → OR","Major Dehiscence → OR","30-day Mortality",
+  "◉ PRIMARY ENDPOINT","Clavien-Dindo Grade",
+  "Minor Complication?","Minor Comp Detail","30-day Readmission","30-day Reoperation",
+  "LOS since enrollment (days) ","ICU Admission","90-day Recurrence",
+  "30-day F/U Done?","90-day F/U Done?","Notes",
+];
+
+/* His sheet writes dates as M/D/YYYY, not ISO. */
+function usDate(v){
+  if(!v) return "";
+  const d = new Date(v);
+  if(Number.isNaN(d.getTime())) return "";
+  return `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+const yn = (v) => (v === true ? "Y" : v === false ? "N" : "");
+
+/* One row per patient, shaped once and consumed by both the .xlsx export
+   and the CSV fallback — so the two can never drift apart. */
+export function buildResearchRows(cases, outcomes) {
+  const live = cases.filter(c => !c.voidedAt);
+  const outBy = new Map(outcomes.filter(o => !o.voidedAt).map(o => [o.studyId, o]));
+
+  const byStudy = new Map();
+  for (const c of live) byStudy.set(c.studyId, (byStudy.get(c.studyId) || []).concat(c));
+
+  const earliest = (rows, type) => rows
+    .filter(r => (r.assessmentType || "new") === type)
+    .sort((a, b) => new Date(a.enrollmentDate || a.savedAt) - new Date(b.enrollmentDate || b.savedAt))[0] || null;
+  const yn = (v) => (v === true ? "Y" : v === false ? "N" : "");
+
+  return [...byStudy.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([studyId, all]) => {
+    const first = earliest(all, "new");
+    const reassess = earliest(all, "reassessment");
+    const preop = earliest(all, "preop");
+    const o = outBy.get(studyId);
+    const s = (o && o.secondary) || {};
+    const oc = (o && o.outcomes) || {};
+    const dateOf = (a) => (a ? (a.enrollmentDate || a.savedAt) : null);
+
+    /* Extra same-type assessments are real data with nowhere to go in this
+       layout — say so in Notes rather than dropping them silently. */
+    const extras = all.length - [first, reassess, preop].filter(Boolean).length;
+    const notes = [o?.notes, extras > 0 ? `[${extras} additional assessment${extras === 1 ? "" : "s"} not shown in this layout]` : ""]
+      .filter(Boolean).join(" · ");
+
+    return {
+      studyId,
+      firstDate: dateOf(first), firstScore: first ? first.score : null,
+      reassessScore: reassess ? reassess.score : null,
+      preopDate: dateOf(preop), preopScore: preop ? preop.score : null,
+      debridements: s.debridements ?? null, flapType: s.flapType ?? "",
+      cfl: o ? yn(oc.cfl) : "", pfl: o ? yn(oc.pfl) : "", ssi: o ? yn(oc.ssi) : "",
+      hem: o ? yn(oc.hem) : "", deh: o ? yn(oc.deh) : "", mort: o ? yn(oc.mort) : "",
+      anyEvent: o ? (o.anyEvent ? "YES — EVENT" : "NO event") : "",
+      clavien: o?.clavienDindo ?? "",
+      minorComp: s.minorComp ?? "", minorDetail: s.minorDetail ?? "",
+      readmit30: s.readmit30 ?? "", reop30: s.reop30 ?? "",
+      los: s.los ?? null, icu: s.icu ?? "", recur90: s.recur90 ?? "",
+      fu30: s.fu30 ?? "", fu90: s.fu90 ?? "",
+      notes,
+    };
+  });
+}
+
+export function buildResearchCSV(cases, outcomes) {
+  const rows = buildResearchRows(cases, outcomes).map(p => [
+    p.studyId, "", "", "", "",                       // PHI + demographics: blank by design
+    usDate(p.firstDate), p.firstScore ?? "", p.reassessScore ?? "",
+    usDate(p.preopDate), p.preopScore ?? "",
+    (p.firstDate && p.preopDate)
+      ? Math.round((new Date(p.preopDate) - new Date(p.firstDate)) / 86400000) : "",
+    p.debridements ?? "", p.flapType,
+    p.cfl, p.pfl, p.ssi, p.hem, p.deh, p.mort, p.anyEvent, p.clavien,
+    p.minorComp, p.minorDetail, p.readmit30, p.reop30,
+    p.los ?? "", p.icu, p.recur90, p.fu30, p.fu90, p.notes,
+  ]);
+  const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  return [RESEARCH_HEADER_1, RESEARCH_HEADER_2, ...rows].map(r => r.map(q).join(",")).join("\n");
+}
+
+const ADMIN_EXTRA_COLS = ["Service","Hospital ID","Entered By","Record ID","Status","Void Reason"];
+
+export function buildAdminCSV(cases, outcomes, serviceNames={}) {
+  const flat = (outcomes||[]).map(o=>({ ...o, notes:String(o.notes||"").replace(/[\r\n]+/g," · ") }));
+  const q = v => `"${String(v??"").replace(/"/g,'""')}"`;
+  const supersededIds = new Set(cases.map(c=>c.supersedesId).filter(Boolean));
+
+  const lines = buildFullCSV(cases, flat).split("\n");
+  return lines.map((line,i)=>{
+    if(i===0) return line + "," + ADMIN_EXTRA_COLS.map(q).join(",");
+    const c = cases[i-1];
+    if(!c) return line;
+    const status = c.voidedAt ? "VOIDED"
+                 : supersededIds.has(c.remoteId) ? "SUPERSEDED"
+                 : c.supersedesId ? "CORRECTION" : "";
+    return line + "," + [
+      serviceNames[c.serviceId] || "", c.hospitalId || "", c.enteredBy || "",
+      c.remoteId || "", status, c.voidReason || "",
+    ].map(q).join(",");
+  }).join("\n");
+}
+
+function downloadCSV(text, name) {
+  /* The leading BOM is not optional. Excel ignores the charset on a data:
+     URL and decodes as the system codepage, which turns every em-dash into
+     "â€"" — so "YES — EVENT" arrives mangled. A Blob plus BOM makes Excel
+     read it as UTF-8. */
+  const blob = new Blob(["﻿" + text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* ═══════════════════════════════════════════════
+   DATA INTEGRITY
+
+   What an admin actually needs to see is not "all the rows" but
+   "the rows something is wrong with". Ordered worst-first.
+═══════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════
+   SECONDARY OUTCOME FIELDS
+
+   These are columns in the research workbook that the app previously had
+   no form for, so every outcome a resident entered exported with them
+   blank. Option lists are taken from the dropdown validation already
+   defined in that workbook, so the values match what Pedro expects.
+═══════════════════════════════════════════════ */
+const YNU = ["Y","N","Unknown"];
+const SECONDARY_FIELDS = [
+  { id:"debridements", label:"Debridements before surgery",  type:"number", placeholder:"0" },
+  { id:"flapType",     label:"Type of flap",                 type:"choice",
+    options:["Local rotational","Perforator based","Pedicled musculocutaneous","Free flap","Other"] },
+  { id:"minorComp",    label:"Minor complication?",          type:"choice", options:YNU },
+  { id:"minorDetail",  label:"Minor complication detail",    type:"choice",
+    options:["Minor dehiscence","Minor local superficial infection","Granuloma","Small seroma / hematoma","Other"] },
+  { id:"readmit30",    label:"30-day readmission",           type:"choice", options:YNU },
+  { id:"reop30",       label:"30-day reoperation",           type:"choice", options:YNU },
+  { id:"los",          label:"Length of stay since enrollment (days)", type:"number", placeholder:"e.g. 49" },
+  { id:"icu",          label:"ICU admission",                type:"choice", options:YNU },
+  { id:"recur90",      label:"90-day recurrence",            type:"choice", options:YNU },
+  { id:"fu30",         label:"30-day follow-up done?",       type:"choice", options:["Y","N"] },
+  { id:"fu90",         label:"90-day follow-up done?",       type:"choice", options:["Y","N"] },
+];
+
+const THIRTY_DAYS = 30*24*60*60*1000;
+
+/* Bump whenever upstream changes point values or scoring rules. Stored on
+   every assessment, because a score only means something alongside the
+   engine that produced it. v1.2 (Pedro, 2026-09): osteomyelitis "none"
+   includes treated; smoking gained a 2-week–6-month middle tier; cardio
+   scores symptomatic vs stable rather than condition count; plus the
+   optimization-projection fields. */
+export const ENGINE_VERSION = "1.2";
+
+export function findIssues(cases, outcomes) {
+  const issues = [];
+  const live = cases.filter(c=>!c.voidedAt);
+  const outByStudy = new Map(outcomes.filter(o=>!o.voidedAt).map(o=>[o.studyId,o]));
+
+  /* Recomputing the score from the stored answers is the real tamper check:
+     computeScore is deterministic, so a mismatch means the row did not come
+     from this app's scoring path.
+
+     Two exemptions, both because reconciliation would be comparing against
+     the wrong thing and would drown the real signal in false alarms:
+       - imported rows, where the spreadsheet recorded totals but never the
+         per-question answers
+       - rows scored by an earlier engine, whose point values differed */
+  const staleEngine = new Map();
+  for(const c of live){
+    if(c.source==="import") continue;
+    if(c.engineVersion && c.engineVersion!==ENGINE_VERSION){
+      staleEngine.set(c.engineVersion, (staleEngine.get(c.engineVersion)||0)+1);
+      continue;
+    }
+    const { total, domainScores } = computeScore(c.answers||{});
+    if(typeof c.score==="number" && total!==c.score){
+      issues.push({ sev:"bad", studyId:c.studyId, id:c.remoteId,
+        title:`Score does not match the answers — ${c.studyId}`,
+        body:`Stored score is ${c.score}, but recomputing from the saved answers gives ${total}. This row did not come from the normal scoring path. Entered by ${c.enteredBy||"unknown"}.` });
+      continue;
+    }
+    for(const d of DOMAINS){
+      const stored=(c.domainScores||{})[d.id];
+      if(typeof stored==="number" && stored!==domainScores[d.id]){
+        issues.push({ sev:"bad", studyId:c.studyId, id:c.remoteId,
+          title:`Domain total inconsistent — ${c.studyId}`,
+          body:`${d.label}: stored ${stored}, recomputed ${domainScores[d.id]}.` });
+        break;
+      }
+    }
+  }
+
+  /* Scores from a superseded engine are not wrong, but they are not
+     comparable with current ones — a real problem for a prospective study,
+     and one only an admin can decide how to resolve. */
+  for(const [ver,n] of staleEngine){
+    issues.push({ sev:"warn", studyId:"—", id:null,
+      title:`${n} assessment${n===1?"":"s"} scored on engine ${ver}, not ${ENGINE_VERSION}`,
+      body:`Point values changed between these versions, so these scores are not directly comparable with ones scored since. Re-score them from their saved answers, or analyse them as a separate cohort — but do not pool them silently.` });
+  }
+
+  // Same study scored twice with the same assessment type — likely double entry.
+  const byKey = new Map();
+  for(const c of live){
+    const k = `${c.studyId}::${c.assessmentType||"new"}`;
+    byKey.set(k, (byKey.get(k)||[]).concat(c));
+  }
+  for(const [k,rows] of byKey){
+    if(rows.length>1 && !rows.some(r=>r.supersedesId)){
+      const [studyId,type]=k.split("::");
+      issues.push({ sev:"warn", studyId, id:rows[0].remoteId,
+        title:`Duplicate ${type} assessment — ${studyId}`,
+        body:`${rows.length} separate ${type} assessments exist for this Study ID, none marked as a correction. Entered by ${[...new Set(rows.map(r=>r.enteredBy||"unknown"))].join(", ")}.` });
+    }
+  }
+
+  // Enrolled over 30 days ago with no outcome — the primary endpoint is missing.
+  const now = Date.now();
+  const seen = new Set();
+  for(const c of live){
+    if(seen.has(c.studyId)) continue;
+    seen.add(c.studyId);
+    if(outByStudy.has(c.studyId)) continue;
+    const when = new Date(c.enrollmentDate||c.savedAt).getTime();
+    if(!Number.isNaN(when) && now-when > THIRTY_DAYS){
+      const days=Math.floor((now-when)/(24*60*60*1000));
+      issues.push({ sev:"warn", studyId:c.studyId, id:c.remoteId,
+        title:`No 30-day outcome — ${c.studyId}`,
+        body:`Enrolled ${days} days ago with no outcome recorded. The primary endpoint is missing for this patient.` });
+    }
+  }
+
+  // An outcome with no assessment behind it — orphaned endpoint.
+  const studyIds = new Set(live.map(c=>c.studyId));
+  for(const o of outByStudy.values()){
+    if(!studyIds.has(o.studyId)){
+      issues.push({ sev:"warn", studyId:o.studyId, id:o.remoteId,
+        title:`Outcome with no assessment — ${o.studyId}`,
+        body:`A 30-day outcome exists for this Study ID but no pre-operative assessment does. Recorded by ${o.enteredBy||"unknown"}.` });
+    }
+  }
+
+  const rank={bad:0,warn:1};
+  return issues.sort((a,b)=>rank[a.sev]-rank[b.sev]);
 }
 
 /* ═══════════════════════════════════════════════
@@ -568,6 +920,161 @@ input::placeholder,textarea::placeholder{color:#999 !important;-webkit-text-fill
 .settings-label{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--k4);margin-bottom:10px}
 .settings-input{width:100%;padding:11px 12px;border:1px solid var(--g2);font-family:var(--mono);font-size:12px;color:var(--k);background:var(--w);margin-bottom:8px;outline:none}
 .settings-input:focus{border-color:var(--k)}.settings-note{font-size:12px;color:var(--k4);line-height:1.6}
+
+/* On mobile the sheet is a transparent pass-through (padding lives on .main) */
+.sheet{width:100%}
+
+/* ═══════════════════════════════════════════════
+   RESPONSIVE — Desktop / Tablet web view
+   Full-width top bar + a white content card centered
+   in the viewport (vertically when short, scrolls when
+   tall) on a soft grey backdrop. Single column keeps
+   line length readable — correct UX for a clinical form.
+═══════════════════════════════════════════════ */
+@media (min-width:768px){
+  html,body{background:var(--g1)}
+  /* full-viewport shell — no floating card on .app */
+  .app{max-width:none;width:100%;min-height:100dvh;margin:0;border:none;box-shadow:none;background:var(--g1)}
+  /* full-width black top bar; its content capped + centered */
+  .hdr{position:sticky;top:0;padding:16px 32px}
+  .hdr-row{max-width:1080px;margin:0 auto;width:100%}
+  /* grey region that centers the white card */
+  .main{flex:1;display:flex;flex-direction:column;align-items:center;padding:32px 24px;background:var(--g1)}
+  /* the centered content card — margin:auto centers it vertically when short,
+     scrolls without clipping when tall */
+  .sheet{max-width:520px;margin:auto;background:var(--w);border:1px solid var(--g2);
+         box-shadow:0 1px 3px rgba(0,0,0,.06),0 10px 30px rgba(0,0,0,.05);padding:40px 44px}
+  .sheet-wide{max-width:680px}
+  /* size bumps */
+  .home-hero{padding:36px 0 30px}
+  .home-title{font-size:44px}
+  .home-sub{max-width:320px}
+  .display{font-size:34px}
+  .domain-title{font-size:32px}
+}
+@media (min-width:1024px){
+  .main{padding:40px 32px}
+  .sheet{max-width:540px;padding:44px 48px}
+  .sheet-wide{max-width:700px}
+}
+@media (min-width:1440px){
+  .main{padding:52px 32px}
+  .sheet{max-width:560px;padding:48px 52px}
+  .sheet-wide{max-width:760px}
+  .home-title{font-size:48px}
+  .display{font-size:36px}
+  .domain-title{font-size:34px}
+}
+
+/* ═══════════════════════════════════════════════
+   ACCESSIBILITY — focus visibility + reduced motion
+═══════════════════════════════════════════════ */
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--k);outline-offset:2px}
+.opt:focus-visible,.ci-row:focus-visible,.hosp-card:focus-visible,.confirm-check-row:focus-visible{outline:2px solid var(--k);outline-offset:1px}
+.copy-btn:focus-visible,.btn-p:focus-visible{outline:2px solid var(--w);outline-offset:-4px}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important;scroll-behavior:auto!important}
+}
+
+/* ── Tactile press feedback (instant for reduced-motion via rule above) ── */
+.btn-p,.btn-s,.home-btn-new,.home-btn-sec,.copy-btn,.opt,.ci-row,.hosp-card,.record-item,.tbtn,.export-btn,.confirm-check-row{transition:transform .1s ease,border-color .12s ease,background .12s ease,opacity .12s ease,box-shadow .12s ease}
+.btn-p:active,.home-btn-new:active{transform:scale(.985)}
+.btn-s:active,.home-btn-sec:active,.copy-btn:active,.opt:active,.ci-row:active,.hosp-card:active,.record-item:active,.tbtn:active,.export-btn:active,.confirm-check-row:active{transform:scale(.99)}
+
+/* ═══════════════════════════════════════════════
+   ACCESS SCREEN — service code + roster
+═══════════════════════════════════════════════ */
+.gate{min-height:100dvh;display:flex;flex-direction:column;justify-content:center;padding:32px 24px;max-width:460px;margin:0 auto}
+.gate-hero{text-align:center;margin-bottom:34px}
+.gate-brand{font-family:var(--serif);font-style:italic;font-size:42px;letter-spacing:-.03em;color:var(--k);line-height:1.05}
+.gate-tagline{font-size:12.5px;color:var(--k4);margin-top:8px;line-height:1.6}
+.gate-label{font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--k4);margin-bottom:8px}
+.gate-input{width:100%;padding:15px 16px;border:1.5px solid var(--g2);font-family:var(--mono);font-size:16px;letter-spacing:.08em;color:var(--k);background:var(--w);outline:none;text-transform:uppercase}
+.gate-input:focus{border-color:var(--k)}
+.gate-input.plain{font-family:var(--sans);letter-spacing:normal;text-transform:none}
+.gate-err{font-size:12.5px;color:var(--r);margin-top:10px;line-height:1.5}
+.gate-foot{margin-top:26px;text-align:center}
+.gate-link{background:none;border:none;color:var(--k3);font-family:var(--sans);font-size:12.5px;font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:4px;padding:8px}
+.gate-link:hover{color:var(--k)}
+.google-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:9px;padding:13px 20px;background:var(--w);color:var(--k);border:1px solid var(--g2);font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer}
+.google-btn:hover:not(:disabled){background:var(--g1)}
+.google-btn:disabled{opacity:.5;cursor:not-allowed}
+.auth-divider{display:flex;align-items:center;gap:10px;margin:16px 0;font-size:10.5px;color:var(--k4);letter-spacing:.1em;text-transform:uppercase}
+.auth-divider::before,.auth-divider::after{content:"";flex:1;height:1px;background:var(--g2)}
+.gate-note{font-size:11px;color:var(--g3);line-height:1.7;margin-top:18px;text-align:center}
+.gate-service{font-size:13px;color:var(--k3);text-align:center;margin-bottom:20px}
+.gate-service strong{color:var(--k);font-weight:700}
+.roster-btn{display:flex;align-items:center;gap:11px;width:100%;text-align:left;padding:13px 14px;border:1px solid var(--g2);background:var(--w);cursor:pointer;font-family:var(--sans);margin-bottom:6px}
+.roster-btn.sel{border-color:var(--k);background:var(--g1)}
+.roster-radio{width:16px;height:16px;border:1.5px solid var(--g3);border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.roster-btn.sel .roster-radio{border-color:var(--k)}
+.roster-dot{width:8px;height:8px;background:var(--k);border-radius:50%}
+/* Both were inline spans, so the name and the role ran together as
+   "Iakov EfimenkoRESIDENT". They need to stack. */
+.roster-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.roster-name{display:block;font-size:13.5px;font-weight:500;color:var(--k);line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.roster-role{display:block;font-family:var(--mono);font-size:9.5px;color:var(--k4);text-transform:uppercase;letter-spacing:.08em;line-height:1.2}
+
+/* ── Header account + sync chips ── */
+.hdr-acct{display:flex;align-items:center;gap:7px;background:none;border:1px solid #333;color:#bbb;font-family:var(--sans);font-size:10.5px;font-weight:600;padding:4px 9px;border-radius:4px;cursor:pointer;max-width:150px}
+.hdr-acct:hover{border-color:#666;color:#fff}
+.hdr-acct-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sync-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sync-dot.ok{background:#16a34a}
+.sync-dot.pending{background:#ca8a04}
+.sync-dot.off{background:#666}
+.sync-dot.bad{background:var(--r)}
+.sync-banner{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#fefce8;border-left:2px solid #ca8a04;font-size:12px;color:#713f12;margin-bottom:16px;line-height:1.5}
+.sync-banner.offline{background:var(--g1);border-color:var(--g3);color:var(--k3)}
+.sync-banner.failed{align-items:flex-start;background:#fff8f8;border-left-width:3px;border-color:var(--r);color:#7f1d1d;padding:12px 14px}
+
+/* ═══════════════════════════════════════════════
+   ADMIN — monitoring across every service
+═══════════════════════════════════════════════ */
+.adm-tabs{display:flex;gap:4px;border-bottom:1px solid var(--g2);margin-bottom:18px;overflow-x:auto}
+.adm-tab{background:none;border:none;border-bottom:2px solid transparent;font-family:var(--sans);font-size:12.5px;font-weight:600;color:var(--k4);padding:9px 12px;cursor:pointer;white-space:nowrap}
+.adm-tab.on{color:var(--k);border-bottom-color:var(--k)}
+.adm-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(88px,1fr));gap:8px;margin-bottom:20px}
+.adm-stat{border:1px solid var(--g2);padding:11px 12px}
+.adm-stat-n{font-family:var(--serif);font-style:italic;font-size:26px;line-height:1;color:var(--k)}
+.adm-stat-n.warn{color:#b45309}.adm-stat-n.bad{color:var(--r)}
+.adm-stat-l{font-size:10px;color:var(--k4);margin-top:5px;line-height:1.35;letter-spacing:.02em}
+.adm-filters{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.adm-chip{font-size:11.5px;font-family:var(--sans);font-weight:500;padding:5px 11px;border:1px solid var(--g2);background:var(--w);color:var(--k3);cursor:pointer;border-radius:14px}
+.adm-chip.on{background:var(--k);border-color:var(--k);color:var(--w)}
+.adm-search{width:100%;padding:10px 12px;border:1px solid var(--g2);font-family:var(--mono);font-size:12px;color:var(--k);background:var(--w);outline:none;margin-bottom:12px}
+.adm-search:focus{border-color:var(--k)}
+.adm-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px}
+.adm-table{width:100%;border-collapse:collapse;font-size:12px;min-width:620px}
+.adm-table th{text-align:left;font-size:9.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--k4);padding:7px 9px;border-bottom:1px solid var(--g2);white-space:nowrap}
+.adm-table td{padding:9px;border-bottom:1px solid var(--g1);vertical-align:top}
+.adm-table tbody tr:hover{background:var(--g1)}
+.adm-table tr.voided td{opacity:.45;text-decoration:line-through}
+.adm-mono{font-family:var(--mono);font-size:11.5px}
+.adm-flagpill{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 6px;border-radius:2px;background:#fee2e2;color:#991b1b;margin-left:5px}
+.adm-flagpill.warn{background:#fef9c3;color:#854d0e}
+.adm-flagpill.info{background:var(--g1);color:var(--k3)}
+.adm-void{background:none;border:1px solid var(--g2);color:var(--k4);font-family:var(--sans);font-size:10.5px;font-weight:600;padding:3px 8px;cursor:pointer;white-space:nowrap}
+.adm-void:hover{border-color:var(--r);color:var(--r)}
+.adm-issue{border-left:2px solid #ca8a04;background:#fefce8;padding:11px 13px;margin-bottom:7px}
+.adm-issue.bad{border-color:var(--r);background:#fff8f8}
+.adm-issue-t{font-size:12px;font-weight:700;color:var(--k);margin-bottom:3px}
+.adm-issue-b{font-size:11.5px;color:var(--k3);line-height:1.55}
+.adm-audit{display:flex;gap:10px;padding:9px 0;border-bottom:1px solid var(--g1);font-size:11.5px}
+.adm-audit-when{font-family:var(--mono);font-size:10.5px;color:var(--k4);flex-shrink:0;width:96px}
+.adm-audit-what{color:var(--k2);line-height:1.5}
+.adm-audit-who{color:var(--k4)}
+
+/* ── Boot splash ── */
+.boot{min-height:100dvh;display:flex;align-items:center;justify-content:center;background:var(--w)}
+.boot-mark{font-family:var(--serif);font-style:italic;font-size:40px;color:var(--g3);animation:bootpulse 1.2s ease-in-out infinite}
+@keyframes bootpulse{0%,100%{opacity:.4}50%{opacity:.9}}
+
+/* ── One-question-at-a-time domain progress dots ── */
+.field-dots{display:flex;gap:6px;margin:14px 0 22px}
+.field-dot{width:6px;height:6px;border-radius:50%;background:var(--g3);transition:background .2s ease,transform .2s ease}
+.field-dot.done{background:var(--k3)}
+.field-dot.active{background:var(--k);transform:scale(1.35)}
 `;
 
 /* ═══════════════════════════════════════════════
@@ -607,18 +1114,33 @@ function ToggleField({field,value,onChange}){
   );
 }
 
+function RecCard({rec,index,reduce}){
 function RecCard({rec,index}){
   const urgent=rec.p===1;
   return(
-    <div className="rec-item">
+    <motion.div className="rec-item"
+      initial={reduce?false:{opacity:0,y:10}}
+      animate={{opacity:1,y:0}}
+      transition={{duration:0.3,delay:Math.min(index*0.045,0.55),ease:[0.22,0.61,0.36,1]}}>
       <div className="rec-meta">
         <span className={`rec-index ${urgent?"urg":""}`}>{String(index+1).padStart(2,"0")}</span>
         {urgent&&<span className="rec-dot"/>}
         <span className={`rec-cat ${urgent?"urg":""}`}>{rec.cat}</span>
       </div>
       <div className="rec-body">{rec.text}</div>
-    </div>
+    </motion.div>
   );
+}
+
+/* Animated count-up for the score; respects reduced motion */
+function AnimatedNumber({value,reduce,duration=0.85}){
+  const [display,setDisplay]=useState(reduce?value:0);
+  useEffect(()=>{
+    if(reduce){ setDisplay(value); return; }
+    const controls=animate(0,value,{duration,ease:[0.16,1,0.3,1],onUpdate:v=>setDisplay(Math.round(v))});
+    return()=>controls.stop();
+  },[value,reduce,duration]);
+  return <>{display}</>;
 }
 
 function TierChip({tierId}){
@@ -677,6 +1199,53 @@ function MasterProjectionBar({ total, tier, projTotal, projTier, improvement }){
   );
 }
 
+function DomainProjectionList({ domainScores, proj, total }){
+  const projImprovement = total - proj.total;
+  const projTier = proj.projFlags.length>0 ? FLAG_TIER : getTier(proj.total);
+  return(
+    <>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+        <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)"}}>Score Breakdown</div>
+      </div>
+      <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:16,lineHeight:1.5}}>
+        Per domain: solid bar = current, slim bar = projected after optimization.
+      </div>
+      {DOMAINS.map(d=>{
+        const ds=domainScores[d.id]??0;
+        const pd=proj.domainScores[d.id]??ds;
+        const delta=ds-pd;
+        const col=DOMAIN_COLORS[d.id]||"#666";
+        let cap;
+        if(delta<=0) cap="No modifiable factors";
+        else if(d.id==="functional"&&proj.supportImproves.social) cap="Projected after support system implementation";
+        else cap="Projected after optimization";
+        return(
+          <div key={d.id} style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:5}}>
+              <span style={{fontSize:12.5,fontWeight:600,color:"var(--k)"}}>{d.label}</span>
+              <span style={{fontFamily:"var(--mono)",fontSize:12,color:"var(--k2)"}}>{ds} <span style={{color:"var(--k4)"}}>/ {d.maxPts}</span></span>
+            </div>
+            <div style={{position:"relative",height:15,background:"#f1f1f1",borderRadius:4,overflow:"hidden"}}>
+              <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${Math.min((ds/d.maxPts)*100,100)}%`,background:col,borderRadius:4,transition:"width .4s"}}/>
+            </div>
+            <div style={{position:"relative",height:6,background:"#f4f4f4",borderRadius:3,overflow:"hidden",marginTop:4}}>
+              <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${Math.min((pd/d.maxPts)*100,100)}%`,background:col,opacity:.5,borderRadius:3,transition:"width .4s"}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginTop:3}}>
+              <span style={{fontSize:9.5,letterSpacing:".03em",color:delta>0?"var(--k4)":"#ccc"}}>{cap}</span>
+              <span style={{fontFamily:"var(--mono)",fontSize:11,fontWeight:700,color:delta>0?col:"#ccc"}}>{delta>0?`−${delta}`:"—"}</span>
+            </div>
+          </div>
+        );
+      })}
+      <div className="b-total" style={{marginTop:12}}>
+        <span className="b-total-lbl">Total F2F Score</span>
+        <span className="b-total-pts">{total} pts{projImprovement>0&&<span style={{fontSize:12,fontWeight:600,color:projTier.accent,marginLeft:8}}>→ {proj.total} projected</span>}</span>
+      </div>
+    </>
+  );
+}
+
 /* ═══════════════════════════════════════════════
    MAIN APP
 ═══════════════════════════════════════════════ */
@@ -708,10 +1277,165 @@ export default function F2FApp(){
   const [outCDOption,   setOutCDOption]   = useState("");      // selected management-level option id
   const [outNotes,      setOutNotes]      = useState("");
   const [outSaved,      setOutSaved]      = useState(false);
+  const [outSecondary,  setOutSecondary]  = useState({});   // secondary research endpoints
   const [openRecs,      setOpenRecs]      = useState({}); // collapsible non-urgent rec categories
   const [fontLevel,     setFontLevel]     = useState(()=>{ try{return parseInt(localStorage.getItem("f2f_fontlevel"))||2;}catch(e){return 2;} });
   const FONT_SCALE = {1:0.9, 2:1.0, 3:1.15, 4:1.35};
   const setFont=(lvl)=>{ setFontLevel(lvl); try{localStorage.setItem("f2f_fontlevel",String(lvl));}catch(e){} };
+
+  // Honour the OS "reduce motion" setting everywhere we animate
+  const reduce = useReducedMotion();
+
+  /* ── Access: service code → roster → app ──────────────
+     Collectors never see an email field. One code, one name,
+     once per device. Admins take the separate door below. */
+  const [authReady,  setAuthReady]  = useState(!isSupabaseConfigured);
+  const [ctx,        setCtx]        = useState(null);
+  const [gateErr,     setGateErr]     = useState("");
+  const [gateBusy,    setGateBusy]    = useState(false);
+  const [serviceList, setServiceList] = useState([]);
+  const [recordScope, setRecordScope] = useState("mine");   // mine | service
+  const [syncState,   setSyncState]   = useState(sync.status());
+
+  const refreshCtx = useCallback(async()=>{
+    try{ setCtx(await fetchContext()); }
+    catch(e){ console.warn("[F2F] context load failed:",e?.message); setCtx(null); }
+  },[]);
+
+  // Resolve the session once on boot, then follow it.
+  useEffect(()=>{
+    if(!isSupabaseConfigured) return;
+    let alive=true;
+    const finish=()=>{ if(alive) setAuthReady(true); };
+    refreshCtx().finally(finish);
+    // Never let a hung network leave the user staring at the splash.
+    const bail=setTimeout(finish,2500);
+    const unsub=onAuthChange(()=>{ refreshCtx().finally(finish); });
+    return()=>{ alive=false; clearTimeout(bail); unsub(); };
+  },[refreshCtx]);
+
+  // Point the sync layer at the current identity whenever it changes.
+  useEffect(()=>{
+    if(!isSupabaseConfigured) return;
+    sync.start(ctx).then(()=>setCases(fetchAllCases())).catch(()=>{});
+    return()=>sync.stop();
+  },[ctx]);
+
+  const [failedList, setFailedList] = useState([]);
+  useEffect(()=>sync.onSyncChange(s=>{ setSyncState(s); setFailedList(sync.failedRecords()); }),[]);
+
+  const whoAmI    = ctx?.displayName || "";
+  const serviceNm = ctx?.service?.name || "";
+
+  /* Rotations, for both the first-run picker and the Settings switcher. */
+  useEffect(()=>{
+    if(!isSupabaseConfigured||!ctx) return;
+    let alive=true;
+    fetchServices()
+      .then(list=>{ if(alive) setServiceList(list); })
+      .catch(e=>{ if(alive) setGateErr(e.message||"Could not load the service list"); });
+    return()=>{ alive=false; };
+  },[ctx?.userId, ctx?.serviceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function handleGoogle(){
+    setGateErr(""); setGateBusy(true);
+    try{ await signInWithGoogle(); }        // navigates away; no need to unset busy
+    catch(e){ setGateErr(e.message); setGateBusy(false); }
+  }
+
+  async function handlePickService(serviceId){
+    setGateErr(""); setGateBusy(true);
+    try{ await setMyService(serviceId); await refreshCtx(); }
+    catch(e){ setGateErr(e.message||"Could not join that service"); }
+    finally{ setGateBusy(false); }
+  }
+
+  /* ── Admin monitoring ─────────────────────────── */
+  const [admTab,     setAdmTab]     = useState("entries");   // entries | issues | users | audit
+  const [admCases,   setAdmCases]   = useState([]);
+  const [admOut,     setAdmOut]     = useState([]);
+  const [admAudit,   setAdmAudit]   = useState([]);
+  const [admUsers,   setAdmUsers]   = useState([]);
+  const [admServices,setAdmServices]= useState([]);
+  const [admSvcId,   setAdmSvcId]   = useState("all");
+  const [admQuery,   setAdmQuery]   = useState("");
+  const [admBusy,    setAdmBusy]    = useState(false);
+  const [admErr,     setAdmErr]     = useState("");
+
+  const loadAdmin=useCallback(async()=>{
+    if(!ctx?.isAdmin) return;
+    setAdmBusy(true); setAdmErr("");
+    try{
+      const [c,o,s,a,u]=await Promise.all([
+        adminDb.fetchAllAssessmentsAdmin(), adminDb.fetchAllOutcomesAdmin(),
+        adminDb.fetchServices(), adminDb.fetchAuditLog(300), adminDb.fetchUsers(),
+      ]);
+      setAdmCases(c); setAdmOut(o); setAdmServices(s); setAdmAudit(a); setAdmUsers(u);
+    }catch(e){ setAdmErr(e.message||"Could not load monitoring data"); }
+    finally{ setAdmBusy(false); }
+  },[ctx]);
+
+  useEffect(()=>{ if(screen==="admin") loadAdmin(); },[screen,loadAdmin]);
+
+  const [xlsxBusy, setXlsxBusy] = useState(false);
+  const [xlsxErr,  setXlsxErr]  = useState("");
+
+  async function handleExportWorkbook(cases,outcomes){
+    setXlsxBusy(true); setXlsxErr("");
+    try{
+      const { buildWorkbook, downloadBlob } = await import("./lib/workbook");
+      const rows = buildResearchRows(cases,outcomes);
+      const blob = await buildWorkbook(rows);
+      downloadBlob(blob, `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.xlsx`);
+      adminDb.logExport("research_workbook_xlsx", rows.length);
+    }catch(e){
+      // Falling back to CSV beats handing back nothing, but say what happened.
+      setXlsxErr(`${e.message}. Falling back to CSV — formatting will be lost.`);
+      downloadCSV(buildResearchCSV(cases,outcomes),
+        `F2F DataCollection - collective ${new Date().toISOString().split("T")[0]}.csv`);
+    }finally{ setXlsxBusy(false); }
+  }
+
+  async function handleVoid(kind,id,studyId){
+    const reason=window.prompt(
+      `Void ${kind} for ${studyId}?\n\nThis does not delete anything — the row stays in the record, marked void with your reason and name. Give a reason:`);
+    if(reason===null) return;
+    if(!reason.trim()){ setAdmErr("A reason is required to void a record."); return; }
+    try{
+      if(kind==="assessment") await adminDb.voidAssessment(id,reason);
+      else                    await adminDb.voidOutcome(id,reason);
+      await loadAdmin();
+    }catch(e){ setAdmErr(e.message||"Void failed"); }
+  }
+
+  async function handleBlock(u){
+    const on=!u.blocked;
+    const ok=window.confirm(on
+      ? `Block ${u.email}?
+
+They will immediately lose all access — they cannot read or enter anything. Their existing entries are kept.`
+      : `Restore access for ${u.email}?`);
+    if(!ok) return;
+    try{ await adminDb.setUserBlocked(u.id,on); await loadAdmin(); }
+    catch(e){ setAdmErr(e.message||"Could not change that account"); }
+  }
+
+  async function handleSignOut(){
+    /* Sign-out wipes the local cache so a shared device leaks nothing — which
+       would also destroy anything that never made it to the server. */
+    const unsaved = sync.failedCount() + sync.pendingCount();
+    if(unsaved>0){
+      const ids = sync.failedRecords().map(f=>f.studyId).join(", ");
+      const ok = window.confirm(
+        `${unsaved} entr${unsaved===1?"y has":"ies have"} not been saved to the research database yet` +
+        `${ids?` (${ids})`:""}.\n\nSigning out erases them from this device permanently.\n\n` +
+        `Cancel and reconnect if you can. Sign out anyway?`);
+      if(!ok) return;
+    }
+    await signOut();
+    sync.clearLocalCache();
+    setCtx(null); setCases([]); setServiceList([]); setGateErr(""); setScreen("home");
+  }
 
   // Load persisted cases on mount
   useEffect(()=>{
@@ -756,6 +1480,35 @@ export default function F2FApp(){
   const pct = wizStep===1?5 : wizStep===6?100 : Math.round(5+(completedDomainPages/totalDomainPages)*90);
 
   /* ── HANDLERS ── */
+  /* The Study ID is the primary key of the whole study, and it was accepted
+     as any 4+ characters — which is how "LCH-" with no number got saved.
+     Validate the shape, and refuse to start a NEW patient on an ID that
+     already exists. The de-identification log stays the authority on which
+     number comes next; this only rejects what is obviously wrong. */
+  function studyIdProblem(raw, hosp, type){
+    const id=(raw||"").trim().toUpperCase();
+    if(!id) return "Enter a Study ID.";
+    const m=id.match(/^([A-Z]{2,5})-(\d{1,4})$/);
+    if(!m) return `Use the format ${hosp?hosp.id:"LCH"}-001 — a hospital code, a dash, then a number.`;
+    if(hosp&&m[1]!==hosp.id) return `This ID starts with ${m[1]} but you selected ${hosp.name}. Expected ${hosp.id}-${m[2]}.`;
+    if(type==="new"){
+      const clash=cases.find(c=>c.studyId===id);
+      if(clash){
+        const who=clash.enteredBy?` by ${clash.enteredBy}`:"";
+        const when=(clash.enrollmentDate||clash.savedAt||"").slice(0,10);
+        return `${id} already exists${who}${when?` on ${when}`:""}. For an existing patient use Re-Assessment or Pre-Operative Score instead of New Patient.`;
+      }
+    }
+    return null;
+  }
+
+  const newIdProblem = selectedHosp&&manualId.trim() ? studyIdProblem(manualId,selectedHosp,"new") : null;
+  /* Re-assessment / pre-op: shape only — the hospital comes from the prefix. */
+  const existingIdProblem = existingId.trim() ? studyIdProblem(existingId,null,"existing") : null;
+
+  function handleConfirmId(){
+    if(!selectedHosp) return;
+    if(studyIdProblem(manualId,selectedHosp,"new")) return;
   function handleConfirmId(){
     if(!selectedHosp||manualId.trim().length<4) return;
     const id=manualId.trim().toUpperCase();
@@ -788,6 +1541,7 @@ export default function F2FApp(){
           const caseData={
             studyId, hospital:hospital.name, hospitalId:hospital.id, enrollmentDate:enrollDate,
             assessmentType:assessType||"new",
+            savedAt:new Date().toISOString(),engineVersion:ENGINE_VERSION, answers:{...answers}, score:total,
             savedAt:new Date().toISOString(), answers:{...answers}, score:total,
             tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
             flagged:hasScoreFlags, flagIds:ciFlags.map(c=>c.flagId),
@@ -850,6 +1604,7 @@ export default function F2FApp(){
 
   function saveOutcome(){
     const sid=outStudyId.trim().toUpperCase();
+    if(studyIdProblem(sid,null,"existing")) return;
     if(sid.length<4) return;
     const derivedGrade=cdGradeFromOption(outCDOption);
     const data={
@@ -859,6 +1614,7 @@ export default function F2FApp(){
       cdOption:outCDOption,
       notes:outNotes,
       anyEvent:OUTCOME_FIELDS.some(f=>outFields[f.id]===true),
+      secondary:{...outSecondary},
       recordedAt:new Date().toISOString(),
     };
     persistOutcome(sid,data);
@@ -867,6 +1623,7 @@ export default function F2FApp(){
   }
 
   function resetOutcome(){
+    setOutStudyId(""); setOutFields({}); setOutCD(""); setOutCDOption(""); setOutNotes(""); setOutSaved(false); setOutSecondary({});
     setOutStudyId(""); setOutFields({}); setOutCD(""); setOutCDOption(""); setOutNotes(""); setOutSaved(false);
   }
 
@@ -899,6 +1656,12 @@ export default function F2FApp(){
         <button className="home-btn-sec" style={{borderStyle:"dashed"}} onClick={startQuickScore}>
           Quick Score — not saved
         </button>
+        {ctx?.isAdmin&&(
+          <button className="home-btn-sec" style={{borderColor:"var(--k)",fontWeight:700}}
+            onClick={()=>setScreen("admin")}>
+            Monitoring — all services
+          </button>
+        )}
       </div>
       <div className="alert al-dark" style={{marginBottom:20}}>
         <div className="al-title" style={{color:"var(--k)"}}>Clinical Disclaimer</div>
@@ -969,12 +1732,16 @@ export default function F2FApp(){
                 value={manualId}
                 onChange={e=>setManualId(e.target.value.toUpperCase())}
               />
+              {newIdProblem
+                ? <div className="gate-err">{newIdProblem}</div>
+                : <div style={{fontSize:11,color:"var(--k4)"}}>Enter the next Study ID from your de-identification log. Format: {selectedHosp.id}-001, {selectedHosp.id}-002, etc.</div>}
               <div style={{fontSize:11,color:"var(--k4)"}}>Enter the next Study ID from your de-identification log. Format: {selectedHosp.id}-001, {selectedHosp.id}-002, etc.</div>
             </div>
           )}
           <div style={{marginTop:8,display:"flex",gap:8}}>
             <button className="btn-s" onClick={()=>setAssessType(null)}>← Back</button>
             <button className="btn-p" style={{flex:2}}
+              disabled={!selectedHosp||!manualId.trim()||Boolean(newIdProblem)}
               disabled={!selectedHosp||manualId.trim().length<4}
               onClick={handleConfirmId}>
               Confirm & Continue →
@@ -1004,10 +1771,17 @@ export default function F2FApp(){
             value={existingId}
             onChange={e=>setExistingId(e.target.value.toUpperCase())}
           />
+          {existingIdProblem
+            ? <div className="gate-err" style={{marginBottom:4}}>{existingIdProblem}</div>
+            : existingId.trim()&&!cases.some(c=>c.studyId===existingId.trim().toUpperCase())
+              ? <div className="gate-err" style={{marginBottom:4}}>
+                  No assessment exists yet for {existingId.trim().toUpperCase()}. Check the ID, or start it as a New Patient.
+                </div>
+              : null}
           <div style={{display:"flex",gap:8,marginTop:4}}>
             <button className="btn-s" onClick={()=>setAssessType(null)}>← Back</button>
             <button className="btn-p" style={{flex:2}}
-              disabled={existingId.trim().length<4}
+              disabled={!existingId.trim()||Boolean(existingIdProblem)}
               onClick={()=>{
                 const now=new Date().toISOString().split("T")[0];
                 // Infer hospital from study ID prefix
@@ -1109,6 +1883,42 @@ export default function F2FApp(){
       {wizStep>=2&&wizStep<=5&&domain&&currentPage&&(
         <div>
           <div className="domain-tag">Domain {wizStep-1} of 4 · {domain.label}</div>
+          <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:2}}>
+            Question {fieldStep+1} of {domainPages.length}
+          </div>
+          <div className="field-dots">
+            {domainPages.map((p,i)=>{
+              const done = p.type==="single"
+                ? answers[p.field.id]!==undefined
+                : p.fields.every(f=>answers[f.id]!==undefined);
+              return <span key={i} className={`field-dot ${i===fieldStep?"active":""} ${done?"done":""}`}/>;
+            })}
+          </div>
+
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div key={`${wizStep}-${fieldStep}`}
+              initial={reduce?{opacity:0}:{opacity:0,x:26}}
+              animate={{opacity:1,x:0}}
+              exit={reduce?{opacity:0}:{opacity:0,x:-26}}
+              transition={{duration:reduce?0.12:0.3,ease:[0.22,0.61,0.36,1]}}>
+              {currentPage.type==="single"&&(
+                <RadioField field={currentPage.field} value={answers[currentPage.field.id]} onChange={updateAnswer}/>
+              )}
+
+              {currentPage.type==="toggles"&&(
+                <div>
+                  <div className="domain-title" style={{marginBottom:16}}>{domain.label}</div>
+                  {currentPage.fields.map(f=>(
+                    <ToggleField key={f.id} field={f} value={answers[f.id]} onChange={updateAnswer}/>
+                  ))}
+                  <div style={{marginTop:12,padding:"10px 12px",background:"var(--g1)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:11.5,color:"var(--k4)"}}>Domain score so far</span>
+                    <span style={{fontFamily:"var(--mono)",fontSize:14,color:"var(--k)",fontWeight:500}}>{domainScores[domain.id]??0} / {domain.maxPts} pts</span>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          </AnimatePresence>
           <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:20}}>
             Question {fieldStep+1} of {domainPages.length}
           </div>
@@ -1152,6 +1962,12 @@ export default function F2FApp(){
           </div>
 
           {/* ══ VERDICT PANEL — dramatic, colored by tier ══ */}
+          <motion.div style={{background:tier.bg,borderRadius:14,padding:"28px 22px 24px",marginBottom:20,textAlign:"center",border:`1px solid ${tier.bar}22`}}
+            initial={reduce?false:{opacity:0,scale:0.97}} animate={{opacity:1,scale:1}}
+            transition={{duration:0.45,ease:[0.22,0.61,0.36,1]}}>
+            {/* Score number + denom */}
+            <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,marginBottom:4}}>
+              <span style={{fontFamily:"var(--serif)",fontSize:72,fontStyle:"italic",lineHeight:1,letterSpacing:"-.04em",color:tier.ink}}><AnimatedNumber value={total} reduce={reduce}/></span>
           <div style={{background:tier.bg,borderRadius:14,padding:"28px 22px 24px",marginBottom:20,textAlign:"center",border:`1px solid ${tier.bar}22`}}>
             {/* Score number + denom */}
             <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,marginBottom:4}}>
@@ -1160,6 +1976,16 @@ export default function F2FApp(){
             </div>
 
             {/* Tier label — large and bold */}
+            <motion.div style={{fontSize:38,fontWeight:800,lineHeight:1.05,letterSpacing:"-.02em",color:tier.ink,marginTop:12,marginBottom:6}}
+              initial={reduce?false:{opacity:0,y:6}} animate={{opacity:1,y:0}} transition={{delay:0.55,duration:0.4}}>
+              {tier.label}
+            </motion.div>
+
+            {/* Plain-language verdict — states good or not */}
+            <motion.div style={{fontSize:16,fontWeight:700,color:tier.accent,marginBottom:14,lineHeight:1.3}}
+              initial={reduce?false:{opacity:0,y:6}} animate={{opacity:1,y:0}} transition={{delay:0.65,duration:0.4}}>
+              {tier.verdict}
+            </motion.div>
             <div style={{fontSize:38,fontWeight:800,lineHeight:1.05,letterSpacing:"-.02em",color:tier.ink,marginTop:12,marginBottom:6}}>
               {tier.label}
             </div>
@@ -1181,6 +2007,13 @@ export default function F2FApp(){
                 )}
               </div>
             )}
+          </motion.div>
+
+          {!isQuick&&(
+            <div className="alert al-green" style={{marginBottom:16}}>
+              <div className="al-body" style={{color:"#15803d"}}>✓ Saved to Patient Records as <strong>{studyId}</strong> ({assessLabel}). Persists on this device.</div>
+            </div>
+          )}
           </div>
 
           {!isQuick&&(
@@ -1231,6 +2064,7 @@ export default function F2FApp(){
           <MasterProjectionBar total={total} tier={tier} projTotal={proj.total} projTier={projTier} improvement={projImprovement}/>
 
           <div style={{marginBottom:24}}>
+            <DomainProjectionList domainScores={domainScores} proj={proj} total={total}/>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
               <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)"}}>Score Breakdown</div>
             </div>
@@ -1289,6 +2123,12 @@ export default function F2FApp(){
                         Urgent — Act Immediately
                       </div>
                       {urgent.map((r,i)=>(
+                        <motion.div key={i} style={{border:"1px solid var(--r)",borderLeft:"3px solid var(--r)",borderRadius:8,padding:"14px 16px",marginBottom:8,background:"#fff8f8"}}
+                          initial={reduce?false:{opacity:0,y:10}} animate={{opacity:1,y:0}}
+                          transition={{duration:0.3,delay:Math.min(0.2+i*0.06,0.6),ease:[0.22,0.61,0.36,1]}}>
+                          <div style={{fontSize:12.5,fontWeight:700,color:"var(--r)",marginBottom:6,lineHeight:1.3}}>{r.cat}</div>
+                          <div style={{fontSize:13,color:"var(--k2)",lineHeight:1.7}}>{r.text}</div>
+                        </motion.div>
                         <div key={i} style={{border:"1px solid var(--r)",borderLeft:"3px solid var(--r)",borderRadius:8,padding:"14px 16px",marginBottom:8,background:"#fff8f8"}}>
                           <div style={{fontSize:12.5,fontWeight:700,color:"var(--r)",marginBottom:6,lineHeight:1.3}}>{r.cat}</div>
                           <div style={{fontSize:13,color:"var(--k2)",lineHeight:1.7}}>{r.text}</div>
@@ -1350,6 +2190,17 @@ export default function F2FApp(){
   const renderRecords=()=>{
     const outcomes=fetchAllOutcomes();
     const outSet=new Set(outcomes.map(o=>o.studyId));
+
+    /* "Mine" is a view, not a boundary — the service is the real boundary, and
+       a patient must stay reachable when the resident who enrolled them is off
+       service. So this filters the same list rather than restricting it. */
+    const mine=c=>whoAmI&&c.enteredBy===whoAmI;
+    const mineCount=cases.filter(mine).length;
+    const shown=recordScope==="mine"?cases.filter(mine):cases;
+
+    // Group by studyId
+    const groups={};
+    shown.forEach(c=>{ (groups[c.studyId]=groups[c.studyId]||[]).push(c); });
     // Group by studyId
     const groups={};
     cases.forEach(c=>{ (groups[c.studyId]=groups[c.studyId]||[]).push(c); });
@@ -1366,6 +2217,36 @@ export default function F2FApp(){
         <div className="records-header">
           <div>
             <div className="display" style={{fontSize:24,marginBottom:2}}>Patient Records</div>
+            <div className="records-count">
+              {shown.length} record{shown.length!==1?"s":""}
+              {serviceNm?` · ${serviceNm}`:""} · no PHI
+            </div>
+          </div>
+          {cases.length>0&&<button className="export-btn" onClick={exportAllCSV}>Export CSV</button>}
+        </div>
+
+        {isSupabaseConfigured&&cases.length>0&&(
+          <div className="adm-filters" style={{marginBottom:14}}>
+            <button className={`adm-chip ${recordScope==="mine"?"on":""}`} onClick={()=>setRecordScope("mine")}>
+              My patients ({mineCount})
+            </button>
+            <button className={`adm-chip ${recordScope==="service"?"on":""}`} onClick={()=>setRecordScope("service")}>
+              Whole service ({cases.length})
+            </button>
+          </div>
+        )}
+
+        {shown.length===0&&(
+          <div className="empty-state">
+            <div className="empty-icon">📋</div>
+            <div className="empty-text">
+              {recordScope==="mine"&&cases.length>0?"You have not entered any patients yet":"No records yet"}
+            </div>
+            <div className="empty-sub">
+              {recordScope==="mine"&&cases.length>0
+                ? <>Your service has {cases.length} — <button className="gate-link" style={{fontSize:12,padding:0}} onClick={()=>setRecordScope("service")}>show the whole service</button></>
+                : "Complete a patient assessment to see it here"}
+            </div>
             <div className="records-count">{cases.length} record{cases.length!==1?"s":""} · persistent · no PHI</div>
           </div>
           {cases.length>0&&<button className="export-btn" onClick={exportAllCSV}>Export CSV</button>}
@@ -1398,6 +2279,8 @@ export default function F2FApp(){
                     </div>
                   </div>
                   <div className="record-right">
+                    {isSupabaseConfigured&&c._sync==="failed"&&<span className="adm-flagpill">not saved</span>}
+                    {isSupabaseConfigured&&c._sync!=="failed"&&c._sync!=="synced"&&<span className="adm-flagpill warn">pending</span>}
                     <span className="record-score">{c.score}</span>
                     <TierChip tierId={c.tierId}/>
                   </div>
@@ -1415,6 +2298,9 @@ export default function F2FApp(){
     const t=(selCase.tierId==="flagged"?FLAG_TIER:TIERS.find(t=>t.id===selCase.tierId))||TIERS[0];
     const d=selCase.domainScores||{};
     const detailRecs=buildRecs(selCase.answers||{},selCase.tierId);
+    const detailProj=projectScore(selCase.answers||{});
+    const detailProjTier=detailProj.projFlags.length>0 ? FLAG_TIER : getTier(detailProj.total);
+    const detailImprovement=(typeof selCase.score==="number"?selCase.score:0) - detailProj.total;
     return(
       <div>
         <button className="back-link" onClick={()=>setScreen("records")}>← Records</button>
@@ -1433,17 +2319,13 @@ export default function F2FApp(){
             {t.timing&&<div style={{marginTop:8,paddingTop:8,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:11,color:t.accent,fontWeight:600}}>⏱ {t.timing}</div>}
           </div>
         </div>
+        <MasterProjectionBar total={selCase.score??0} tier={t} projTotal={detailProj.total} projTier={detailProjTier} improvement={detailImprovement}/>
         <div style={{marginBottom:24}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
-          {DOMAINS.map(dom=>{
-            const ds=d[dom.id]??0;
-            return(<div className="b-row" key={dom.id}><span className="b-name">{dom.label}</span><div className="b-right"><div className="b-bar-wrap"><div className="b-bar-fill" style={{width:`${Math.min((ds/dom.maxPts)*100,100)}%`}}/></div><span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{dom.maxPts}</span></span></div></div>);
-          })}
-          <div className="b-total" style={{marginTop:12}}><span className="b-total-lbl">Total F2F Score</span><span className="b-total-pts">{selCase.score} pts</span></div>
+          <DomainProjectionList domainScores={d} proj={detailProj} total={selCase.score??0}/>
         </div>
         <div style={{marginBottom:24}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:16}}>Patient-Specific Action Plan</div>
-          {detailRecs.map((r,i)=><RecCard key={i} rec={r} index={i}/>)}
+          {detailRecs.map((r,i)=><RecCard key={i} rec={r} index={i} reduce={reduce}/>)}
         </div>
       </div>
     );
@@ -1478,6 +2360,10 @@ export default function F2FApp(){
               value={outStudyId}
               onChange={e=>{setOutStudyId(e.target.value.toUpperCase());setOutSaved(false);}}
             />
+            {!studyIdProblem(sid,null,"existing")&&!known.includes(sid)&&(
+              <div style={{fontSize:11,color:"#b45309",marginBottom:8}}>⚠ No scored assessment found for this ID on this device. You can still record the outcome — verify the ID is correct.</div>
+            )}
+            {!studyIdProblem(sid,null,"existing")&&known.includes(sid)&&(
             {sid.length>=4&&!known.includes(sid)&&(
               <div style={{fontSize:11,color:"#b45309",marginBottom:8}}>⚠ No scored assessment found for this ID on this device. You can still record the outcome — verify the ID is correct.</div>
             )}
@@ -1490,6 +2376,7 @@ export default function F2FApp(){
               </div>
             )}
 
+            {!studyIdProblem(sid,null,"existing")&&(
             {sid.length>=4&&(
               <>
                 <div className="rule"/>
@@ -1532,6 +2419,38 @@ export default function F2FApp(){
                   )}
                 </div>
 
+                {/* Secondary endpoints — the columns the research workbook
+                    tracks. All optional: an outcome can be saved on the
+                    primary endpoints alone. */}
+                <div style={{marginTop:24}}>
+                  <div className="rule"/>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"var(--k4)",marginBottom:4}}>Secondary Outcomes</div>
+                  <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:14}}>
+                    Optional, but these are columns in the research workbook — anything left blank has to be filled in by hand later.
+                  </div>
+
+                  {SECONDARY_FIELDS.map(f=>(
+                    <div key={f.id} style={{marginBottom:14}}>
+                      <div className="qlabel" style={{marginBottom:6}}>{f.label}</div>
+                      {f.type==="number"
+                        ? <input type="number" inputMode="numeric" min="0"
+                            value={outSecondary[f.id]??""}
+                            onChange={e=>setOutSecondary(p=>({...p,[f.id]:e.target.value===""?null:Number(e.target.value)}))}
+                            placeholder={f.placeholder||""}
+                            style={{width:"100%",padding:"11px 12px",border:"1px solid var(--g2)",fontFamily:"var(--mono)",fontSize:14,color:"#111",background:"#fff",outline:"none"}}/>
+                        : <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                            {f.options.map(o=>{
+                              const sel=outSecondary[f.id]===o;
+                              return(
+                                <button key={o} className={`adm-chip ${sel?"on":""}`}
+                                  onClick={()=>setOutSecondary(p=>({...p,[f.id]:sel?null:o}))}>{o}</button>
+                              );
+                            })}
+                          </div>}
+                    </div>
+                  ))}
+                </div>
+
                 <div style={{marginTop:20}}>
                   <div className="qlabel" style={{marginBottom:8}}>Comments (optional)</div>
                   <textarea rows={3} value={outNotes} onChange={e=>setOutNotes(e.target.value)}
@@ -1561,9 +2480,53 @@ export default function F2FApp(){
       <div className="eyebrow">Configuration</div>
       <div className="display" style={{marginBottom:4,fontSize:24}}>Settings</div>
       <div className="rule"/>
+      {isSupabaseConfigured&&ctx&&(
+        <>
+          <div style={{marginBottom:24}}>
+            <div className="settings-label">Signed in</div>
+            <div className="settings-note" style={{marginBottom:12}}>
+              <strong style={{color:"var(--k)"}}>{whoAmI||"Unnamed"}</strong>
+              {ctx.email&&<><br/><span style={{fontFamily:"var(--mono)",fontSize:11}}>{ctx.email}</span></>}
+              {serviceNm&&<><br/>{serviceNm}</>}
+              {ctx.service?.hospital_name&&<><br/>{ctx.service.hospital_name}</>}
+              {ctx.isAdmin&&<><br/><span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--r)",fontWeight:700}}>ADMINISTRATOR</span></>}
+            </div>
+
+            {/* Residents rotate, so changing service has to be self-service. */}
+            <div className="settings-label" style={{marginTop:16}}>Rotation</div>
+            <div className="settings-note" style={{marginBottom:10}}>
+              Change this when you move service. Your existing entries stay where they were recorded.
+            </div>
+            <div className="adm-filters" style={{marginBottom:12}}>
+              {serviceList.map(s=>(
+                <button key={s.id} className={`adm-chip ${ctx.serviceId===s.id?"on":""}`}
+                  disabled={gateBusy||ctx.serviceId===s.id}
+                  onClick={()=>handlePickService(s.id)}>{s.name}</button>
+              ))}
+            </div>
+            {gateErr&&<div className="gate-err" style={{marginBottom:10}}>{gateErr}</div>}
+            <div style={{fontSize:11,fontFamily:"var(--mono)",color:"var(--k4)",marginBottom:12}}>
+              {syncState.failed>0
+                ? <span style={{color:"var(--r)",fontWeight:700}}>
+                    NOT SAVED — {syncState.failed} entr{syncState.failed===1?"y":"ies"} never reached the database
+                  </span>
+                : !syncState.online
+                  ? "OFFLINE — entries are saved on this device and will upload automatically"
+                  : syncState.pending>0
+                    ? `SYNCING — ${syncState.pending} entr${syncState.pending===1?"y":"ies"} waiting to upload`
+                    : syncState.cloud ? "SYNCED — all entries are saved to the research database"
+                                      : "LOCAL ONLY — not connected to the research database"}
+            </div>
+            <button className="btn-s" style={{width:"100%"}} onClick={handleSignOut}>Sign out</button>
+          </div>
+          <div className="rule"/>
+        </>
+      )}
       <div style={{marginBottom:24}}>
         <div className="settings-label">Research Data</div>
         <div className="settings-note" style={{marginBottom:12}}>
+          Assessments and 30-day outcomes save automatically to the research database.
+          Export a CSV here if you need a local copy or a snapshot for analysis.
           All scored assessments and 30-day outcomes are stored locally on this device. Export the full dataset as a CSV to merge into your master research spreadsheet.
         </div>
         <button className="btn-p" onClick={exportAllCSV} disabled={cases.length===0}>
@@ -1621,6 +2584,294 @@ export default function F2FApp(){
 
   const showProg=screen==="wizard"&&wizStep<6;
 
+  /* ═══════════════════════════════════════════════
+     ADMIN — cross-service monitoring
+  ═══════════════════════════════════════════════ */
+  const renderAdmin=()=>{
+    const svcName=Object.fromEntries(admServices.map(s=>[s.id,s.name]));
+    const inScope=r=>admSvcId==="all"||r.serviceId===admSvcId;
+    const q=admQuery.trim().toLowerCase();
+    const matches=r=>!q||[r.studyId,r.enteredBy,svcName[r.serviceId],r.hospital]
+      .some(v=>String(v||"").toLowerCase().includes(q));
+
+    const scoped     = admCases.filter(inScope);
+    const scopedOut  = admOut.filter(inScope);
+    const visible    = scoped.filter(matches);
+    const live       = scoped.filter(c=>!c.voidedAt);
+    const issues     = findIssues(scoped,scopedOut);
+    const supersededIds=new Set(scoped.map(c=>c.supersedesId).filter(Boolean));
+    const patients   = new Set(live.map(c=>c.studyId));
+    const withOutcome= new Set(scopedOut.filter(o=>!o.voidedAt).map(o=>o.studyId));
+    const voided     = scoped.filter(c=>c.voidedAt).length;
+
+    return(
+      <div>
+        <button className="back-link" onClick={()=>setScreen("home")}>← Home</button>
+        <div className="eyebrow">Research oversight</div>
+        <div className="display" style={{fontSize:24,marginBottom:4}}>Monitoring</div>
+        <div className="caption" style={{marginBottom:16}}>
+          Every entry across every service. Nothing here can be deleted — only voided, with a reason and your name attached.
+        </div>
+
+        {admErr&&<div className="alert al-red" style={{marginBottom:14}}><div className="al-body" style={{color:"var(--r)"}}>{admErr}</div></div>}
+
+        <div className="adm-stats">
+          <div className="adm-stat"><div className="adm-stat-n">{patients.size}</div><div className="adm-stat-l">Patients enrolled</div></div>
+          <div className="adm-stat"><div className="adm-stat-n">{live.length}</div><div className="adm-stat-l">Assessments</div></div>
+          <div className="adm-stat"><div className="adm-stat-n">{withOutcome.size}</div><div className="adm-stat-l">30-day outcomes</div></div>
+          <div className="adm-stat"><div className={`adm-stat-n ${issues.some(i=>i.sev==="bad")?"bad":issues.length?"warn":""}`}>{issues.length}</div><div className="adm-stat-l">Issues to review</div></div>
+          <div className="adm-stat"><div className="adm-stat-n">{voided}</div><div className="adm-stat-l">Voided</div></div>
+        </div>
+
+        <div className="adm-filters">
+          <button className={`adm-chip ${admSvcId==="all"?"on":""}`} onClick={()=>setAdmSvcId("all")}>All services</button>
+          {admServices.map(s=>(
+            <button key={s.id} className={`adm-chip ${admSvcId===s.id?"on":""}`} onClick={()=>setAdmSvcId(s.id)}>{s.name}</button>
+          ))}
+        </div>
+
+        <div className="adm-tabs">
+          {[["entries",`Entries (${visible.length})`],["issues",`Issues (${issues.length})`],
+            ["users",`Users (${admUsers.length})`],["audit","Audit trail"]].map(([id,lbl])=>(
+            <button key={id} className={`adm-tab ${admTab===id?"on":""}`} onClick={()=>setAdmTab(id)}>{lbl}</button>
+          ))}
+        </div>
+
+        {admBusy&&<div className="caption" style={{padding:"20px 0"}}>Loading…</div>}
+
+        {!admBusy&&admTab==="entries"&&(
+          <>
+            <input className="adm-search" value={admQuery} placeholder="Filter by Study ID, person, or hospital…"
+              onChange={e=>setAdmQuery(e.target.value)}/>
+            <button className="btn-p" style={{marginBottom:6}}
+              disabled={scoped.length===0||xlsxBusy} onClick={()=>handleExportWorkbook(scoped,scopedOut)}>
+              {xlsxBusy?"Building workbook…"
+                :`Export research workbook (.xlsx) — ${new Set(scoped.filter(c=>!c.voidedAt).map(c=>c.studyId)).size} patients`}
+            </button>
+            <div style={{fontSize:11,color:"var(--k4)",lineHeight:1.55,marginBottom:12}}>
+              The real workbook — every sheet, colour, dropdown and formula preserved.
+              Hospital Account #, DOB and Sex are left blank: they are not stored here,
+              so paste them from the de-identification log. Age, optimization duration
+              and the primary endpoint are formulas and fill themselves in.
+            </div>
+            {xlsxErr&&<div className="gate-err" style={{marginBottom:12}}>{xlsxErr}</div>}
+            <button className="btn-s" style={{width:"100%",marginBottom:14}}
+              disabled={scoped.length===0}
+              onClick={()=>{ downloadCSV(buildAdminCSV(scoped,scopedOut,svcName),
+                `F2F_Audit_Export_${new Date().toISOString().split("T")[0]}.csv`); adminDb.logExport("audit_csv", scoped.length); }}>
+              Audit export — {scoped.length} rows, one per assessment
+            </button>
+            {visible.length===0
+              ? <div className="empty-state"><div className="empty-text">Nothing matches</div></div>
+              : (
+                <div className="adm-scroll">
+                  <table className="adm-table">
+                    <thead><tr>
+                      <th>Study ID</th><th>Type</th><th>Score</th><th>Service</th>
+                      <th>Entered by</th><th>Date</th><th>Outcome</th><th/>
+                    </tr></thead>
+                    <tbody>
+                      {visible.map(c=>{
+                        const hasOut=withOutcome.has(c.studyId);
+                        const sup=supersededIds.has(c.remoteId);
+                        return(
+                          <tr key={c.remoteId} className={c.voidedAt?"voided":""}>
+                            <td className="adm-mono">{c.studyId}</td>
+                            <td>{({new:"New",reassessment:"Re-assess",preop:"Pre-op"})[c.assessmentType]||"New"}
+                              {sup&&<span className="adm-flagpill info">superseded</span>}
+                              {c.supersedesId&&<span className="adm-flagpill info">correction</span>}
+                              {c.voidedAt&&<span className="adm-flagpill">void</span>}
+                            </td>
+                            <td className="adm-mono">{c.score}{c.flagged&&<span className="adm-flagpill">⚑</span>}</td>
+                            <td>{svcName[c.serviceId]||"—"}</td>
+                            <td>{c.enteredBy||"—"}</td>
+                            <td className="adm-mono">{(c.enrollmentDate||c.savedAt||"").slice(0,10)}</td>
+                            <td>{hasOut?<span style={{color:"#15803d",fontWeight:700}}>✓</span>:<span style={{color:"var(--k4)"}}>—</span>}</td>
+                            <td>{!c.voidedAt&&<button className="adm-void" onClick={()=>handleVoid("assessment",c.remoteId,c.studyId)}>Void</button>}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+          </>
+        )}
+
+        {!admBusy&&admTab==="issues"&&(
+          issues.length===0
+            ? <div className="empty-state"><div className="empty-icon">✓</div><div className="empty-text">No issues found</div>
+                <div className="empty-sub">Scores reconcile, no duplicates, no missing endpoints.</div></div>
+            : issues.map((it,i)=>(
+                <div key={i} className={`adm-issue ${it.sev==="bad"?"bad":""}`}>
+                  <div className="adm-issue-t">{it.title}</div>
+                  <div className="adm-issue-b">{it.body}</div>
+                </div>
+              ))
+        )}
+
+        {!admBusy&&admTab==="users"&&(
+          <>
+            <div style={{fontSize:11.5,color:"var(--k4)",lineHeight:1.6,marginBottom:14}}>
+              Anyone with a Google account can sign in and enter data. Blocking an
+              account revokes read and write immediately; its existing entries are
+              kept and stay attributed, so nothing is lost from the study.
+            </div>
+            {admUsers.length===0
+              ? <div className="empty-state"><div className="empty-text">Nobody has signed in yet</div></div>
+              : (
+                <div className="adm-scroll">
+                  <table className="adm-table">
+                    <thead><tr>
+                      <th>Account</th><th>Service</th><th>Role</th><th>Entries</th><th>Last active</th><th/>
+                    </tr></thead>
+                    <tbody>
+                      {admUsers.map(u=>(
+                        <tr key={u.id} className={u.blocked?"voided":""}>
+                          <td>
+                            <div>{u.full_name||"—"}</div>
+                            <div className="adm-mono" style={{color:"var(--k4)"}}>{u.email}</div>
+                          </td>
+                          <td>{u.service_name||<span style={{color:"var(--k4)"}}>none yet</span>}</td>
+                          <td>
+                            {u.role==="admin"
+                              ? <span className="adm-flagpill warn">admin</span>
+                              : <span style={{color:"var(--k4)"}}>collector</span>}
+                            {u.blocked&&<span className="adm-flagpill">blocked</span>}
+                          </td>
+                          <td className="adm-mono">{u.entries ?? 0}</td>
+                          <td className="adm-mono">{u.last_seen?String(u.last_seen).slice(0,10):"—"}</td>
+                          <td>
+                            {u.id!==ctx?.userId&&u.role!=="admin"&&(
+                              <button className="adm-void" onClick={()=>handleBlock(u)}>
+                                {u.blocked?"Unblock":"Block"}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+          </>
+        )}
+
+        {!admBusy&&admTab==="audit"&&(
+          admAudit.length===0
+            ? <div className="empty-state"><div className="empty-text">No activity yet</div></div>
+            : admAudit.filter(a=>admSvcId==="all"||a.service_id===admSvcId).map(a=>(
+                <div key={a.id} className="adm-audit">
+                  <div className="adm-audit-when">{new Date(a.at).toLocaleString(undefined,{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</div>
+                  <div className="adm-audit-what">
+                    <strong>{a.action.replace(/_/g," ")}</strong>
+                    {a.study_id&&<> · <span className="adm-mono">{a.study_id}</span></>}
+                    <div className="adm-audit-who">
+                      {a.actor_name||"unknown"}
+                      {a.action==="redeem_failed"&&<span className="adm-flagpill warn">bad code</span>}
+                      {a.detail?.reason&&<> — “{a.detail.reason}”</>}
+                    </div>
+                  </div>
+                </div>
+              ))
+        )}
+      </div>
+    );
+  };
+
+  /* ═══════════════════════════════════════════════
+     SIGN IN
+     One door: Google. The Gmail account is the identity, so a
+     resident's patients follow them to any device. First sign-in
+     ends on "which service are you on?" — after that, straight through.
+  ═══════════════════════════════════════════════ */
+  const fade=(d=0)=>({
+    initial:reduce?false:{opacity:0,y:10}, animate:{opacity:1,y:0},
+    transition:{duration:0.4,delay:d,ease:[0.22,0.61,0.36,1]},
+  });
+
+  const gateShell=(children)=>(
+    <div className="gate">
+      <motion.div className="gate-hero" {...fade(0)}>
+        <div className="gate-brand">Fitness-to-Flap</div>
+        <div className="gate-tagline">
+          Pre-operative risk stratification<br/>Pressure Injury Module · v1.1
+        </div>
+      </motion.div>
+      <motion.div {...fade(0.08)}>{children}</motion.div>
+      <div className="gate-note" style={{marginTop:28}}>
+        De-identified by design · Study IDs only, no PHI<br/>
+        Research &amp; educational use only
+      </div>
+    </div>
+  );
+
+  const renderSignIn=()=>gateShell(
+    <div>
+      <button className="google-btn" disabled={gateBusy} onClick={handleGoogle}>
+        <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">
+          <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-2.8-.4-4H24v7.3h12.1c-.2 2-1.6 5-4.5 7l-.1.3 6.5 5 .5.1c4.1-3.8 6.6-9.4 6.6-15.7"/>
+          <path fill="#34A853" d="M24 46c5.9 0 10.9-1.9 14.5-5.3l-6.9-5.4c-1.8 1.3-4.3 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.1l-.3v.1l-6.7 5.2-.1.3C8 41.1 15.4 46 24 46"/>
+          <path fill="#FBBC05" d="M11.5 28.4c-.5-1.4-.8-2.9-.8-4.4s.3-3 .7-4.4v-.3l-6.8-5.3-.2.1C2.9 17 2 20.4 2 24s.9 7 2.4 10.1z"/>
+          <path fill="#EB4335" d="M24 10.7c4.1 0 6.9 1.8 8.5 3.3l6.2-6C34.9 4.5 29.9 2 24 2 15.4 2 8 6.9 4.4 13.9l7 5.5c1.8-5.3 6.8-8.7 12.6-8.7"/>
+        </svg>
+        {gateBusy?"Opening Google…":"Sign in with Google"}
+      </button>
+      {gateErr&&<div className="gate-err">{gateErr}</div>}
+      <div className="gate-note">
+        Use your Gmail account. Your patients stay with your account, so you can
+        pick up any device and carry on.
+      </div>
+    </div>
+  );
+
+  const renderPickService=()=>gateShell(
+    <div>
+      <div className="gate-service">Signed in as <strong>{ctx?.email}</strong></div>
+      <div className="gate-label">Which service are you on?</div>
+      {serviceList.length===0
+        ? <div className="gate-note" style={{marginTop:0}}>Loading rotations…</div>
+        : serviceList.map(s=>(
+            <button key={s.id} className="roster-btn" disabled={gateBusy}
+              onClick={()=>handlePickService(s.id)}>
+              <span className="roster-radio"/>
+              <span className="roster-text">
+                <span className="roster-name">{s.name}</span>
+                <span className="roster-role">{s.hospital_name||s.hospital_id||""}</span>
+              </span>
+            </button>
+          ))}
+      {gateErr&&<div className="gate-err">{gateErr}</div>}
+      <div className="gate-note">
+        Everyone on a service shares its patients, so you can continue a colleague's
+        patient and they can continue yours. You can change rotation later in Settings.
+      </div>
+      <div className="gate-foot">
+        <button className="gate-link" onClick={handleSignOut}>Sign out</button>
+      </div>
+    </div>
+  );
+
+  const renderBlocked=()=>gateShell(
+    <div>
+      <div className="alert al-red" style={{marginBottom:20}}>
+        <div className="al-title" style={{color:"var(--r)"}}>Access removed</div>
+        <div className="al-body">
+          <strong>{ctx?.email}</strong> has been blocked from this study by an
+          administrator. Contact the research team if you think this is a mistake.
+        </div>
+      </div>
+      <button className="btn-p" onClick={handleSignOut}>Sign out</button>
+    </div>
+  );
+
+  if(!authReady) return(<><style>{css}</style><div className="boot"><div className="boot-mark">F2F</div></div></>);
+  if(isSupabaseConfigured&&!ctx)         return(<><style>{css}</style>{renderSignIn()}</>);
+  if(isSupabaseConfigured&&ctx.blocked)  return(<><style>{css}</style>{renderBlocked()}</>);
+  /* Admins have oversight without belonging to a rotation, so only collectors
+     are held here until they pick one. */
+  if(isSupabaseConfigured&&!ctx.serviceId&&!ctx.isAdmin) return(<><style>{css}</style>{renderPickService()}</>);
+
   return(
     <>
       <style>{css}</style>
@@ -1633,6 +2884,17 @@ export default function F2FApp(){
             </div>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
               {screen==="wizard"&&wizStep<6&&<div className="hdr-step">{wizStep} / {TOTAL_WIZ-1}</div>}
+              {isSupabaseConfigured&&whoAmI&&(
+                <button className="hdr-acct" onClick={()=>setScreen("settings")}
+                  title={`${whoAmI}${serviceNm?` · ${serviceNm}`:""}`}>
+                  {/* Green only when the server has confirmed everything. */}
+                  <span className={`sync-dot ${
+                    syncState.failed>0 ? "bad"
+                    : !syncState.online ? "off"
+                    : syncState.pending>0 ? "pending" : "ok"}`}/>
+                  <span className="hdr-acct-name">{whoAmI}</span>
+                </button>
+              )}
               <div style={{display:"flex",alignItems:"baseline",gap:1,border:"1px solid #333",borderRadius:4,padding:"2px 3px"}}>
                 {[1,2,3,4].map(lvl=>(
                   <button key={lvl} onClick={()=>setFont(lvl)} title={`Text size ${lvl}`}
@@ -1662,6 +2924,59 @@ export default function F2FApp(){
           )}
         </header>
         <main className="main" style={{zoom:FONT_SCALE[fontLevel]}}>
+          {/* .sheet is a pass-through on mobile; ≥768px it becomes the centered white card */}
+          <div className={`sheet ${screen==="records"?"sheet-wide":""}`}>
+            {/* Failures come first and stay put — this is the one thing a
+                resident must not miss, because the entry is NOT in the study. */}
+            {isSupabaseConfigured&&syncState.failed>0&&(
+              <div className="sync-banner failed">
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:700,marginBottom:3}}>
+                    {syncState.failed} entr{syncState.failed===1?"y was":"ies were"} not saved to the research database
+                  </div>
+                  <div style={{lineHeight:1.5}}>
+                    {failedList.map(f=>f.studyId).join(", ")} — still on this device, but not recorded.
+                    Do not clear your browser data.
+                  </div>
+                  {failedList[0]?.reason&&(
+                    <div style={{marginTop:4,fontFamily:"var(--mono)",fontSize:10.5,opacity:.8}}>
+                      {failedList[0].reason}
+                    </div>
+                  )}
+                  <button className="btn-s" style={{marginTop:8,width:"auto",padding:"7px 14px"}}
+                    onClick={()=>sync.retryFailed().then(()=>setFailedList(sync.failedRecords()))}>
+                    Try again
+                  </button>
+                </div>
+              </div>
+            )}
+            {isSupabaseConfigured&&(!syncState.online||syncState.pending>0)&&(
+              <div className={`sync-banner ${!syncState.online?"offline":""}`}>
+                <span className={`sync-dot ${!syncState.online?"off":"pending"}`}/>
+                {!syncState.online
+                  ? "Offline — your entries are saved on this device and will upload when you reconnect."
+                  : `Uploading ${syncState.pending} entr${syncState.pending===1?"y":"ies"}…`}
+              </div>
+            )}
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div key={screen}
+                initial={reduce?{opacity:0}:{opacity:0,y:8}}
+                animate={{opacity:1,y:0}}
+                exit={reduce?{opacity:0}:{opacity:0,y:-8}}
+                transition={{duration:reduce?0.12:0.24,ease:[0.22,0.61,0.36,1]}}>
+                {screen==="home"        && renderHome()}
+                {screen==="intake"      && renderIntake()}
+                {screen==="id_confirm"  && renderIdConfirm()}
+                {screen==="wizard"      && renderWizard()}
+                {screen==="records"     && renderRecords()}
+                {screen==="detail"      && renderDetail()}
+                {screen==="settings"    && renderSettings()}
+                {screen==="outcomes"    && renderOutcomes()}
+                {screen==="about"       && renderAbout()}
+                {screen==="admin"       && renderAdmin()}
+              </motion.div>
+            </AnimatePresence>
+          </div>
           {screen==="home"        && renderHome()}
           {screen==="intake"      && renderIntake()}
           {screen==="id_confirm"  && renderIdConfirm()}

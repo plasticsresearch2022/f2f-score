@@ -1,0 +1,9 @@
+# Normalise line endings in the repo so the clinical parity check compares
+# against the same bytes on every machine. Without this, a Windows checkout
+# rewrites src/App.jsx as CRLF while the upstream blob stays LF, and the
+# check reports all 14 clinical sections as drifted at once — noise that
+# would train someone to ignore the one check that must be believed.
+* text=auto eol=lf
+
+# The workbook template is a zip; any "text" handling corrupts it.
+*.xlsx binary
