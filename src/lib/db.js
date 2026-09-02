@@ -37,6 +37,10 @@ function rowToCase(row) {
     supersedesId:   row.supersedes_id,
     source:         row.source,
     engineVersion:  row.engine_version,
+    projectedScore:          row.projected_score,
+    projectedImprovement:    row.projected_improvement,
+    projectedTierLabel:      row.projected_tier_label,
+    projectedDomainScores:   row.projected_domain_scores || {},
     voidedAt:       row.voided_at,
     voidReason:     row.void_reason,
   };
@@ -83,6 +87,10 @@ function caseToRow(record, ctx) {
     flag_ids:             record.flagIds || [],
     supersedes_id:        record.supersedesId || null,
     engine_version:       record.engineVersion || undefined,
+    projected_score:          record.projectedScore ?? null,
+    projected_improvement:    record.projectedImprovement ?? null,
+    projected_tier_label:     record.projectedTierLabel || null,
+    projected_domain_scores:  record.projectedDomainScores || null,
   };
 }
 
@@ -107,8 +115,18 @@ function outcomeToRow(record, ctx) {
 
 export async function insertAssessment(record, ctx) {
   if (!supabase) throw new Error("Supabase is not configured");
-  const { data, error } = await supabase
-    .from("assessments").insert(caseToRow(record, ctx)).select().single();
+  const row = caseToRow(record, ctx);
+  let { data, error } = await supabase
+    .from("assessments").insert(row).select().single();
+  /* Pre-v1.2 databases do not have the projection columns yet. Retry
+     without them so a pending dashboard migration cannot block a save. */
+  if (error && /projected_|schema cache/i.test(error.message || "")) {
+    const {
+      projected_score, projected_improvement, projected_tier_label, projected_domain_scores,
+      ...core
+    } = row;
+    ({ data, error } = await supabase.from("assessments").insert(core).select().single());
+  }
   if (error) throw error;
   return rowToCase(data);
 }

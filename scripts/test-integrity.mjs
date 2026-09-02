@@ -30,7 +30,7 @@ const clean = (over = {}) => ({
   remoteId: "r1", studyId: "LCH-001", assessmentType: "new",
   answers: {}, domainScores: { bio: 0, wound: 0, comorbidities: 0, functional: 0 },
   score: 0, tierId: "low", enrollmentDate: ymd(Date.now()), savedAt: iso(Date.now()),
-  source: "app", engineVersion: "1.1",
+  source: "app", engineVersion: "1.2",
   serviceId: "s1", enteredBy: "R. Patel", ...over,
 });
 
@@ -135,7 +135,7 @@ try {
     const cols = (s) => (s.match(/","/g) || []).length + 1;
 
     check("export has exactly one row per case", lines.length === 2, `${lines.length} lines`);
-    check("export keeps Pedro's 40 columns first",
+    check("export keeps Pedro's columns first",
       lines[0].startsWith('"Study ID","Assessment Type","Hospital","Enrollment Date"'), lines[0].slice(0, 80));
     check("export appends provenance columns",
       /"Service","Hospital ID","Entered By","Record ID","Status","Void Reason"$/.test(lines[0]));

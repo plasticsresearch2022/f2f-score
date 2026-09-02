@@ -141,7 +141,8 @@ function buildFullCSV(cases, outcomes) {
     "PI Location","Wound Size","Osteomyelitis","Prior Flap","Soiling","Irradiated Bed",
     "Diabetes HbA1c","Smoking","Cardiopulmonary/Renal","Chronic Steroids",
     "Self-Repositioning","No Pressure Surface","Social Support",
-    "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier","Timestamp",
+    "D1 Total","D2 Total","D3 Total","D4 Total","F2F Total Score","Risk Tier",
+    "Projected Score","Projected Improvement","Projected Tier","Timestamp",
     // 30-day outcome columns (populated once per Study ID)
     "Complete Flap Failure","Partial Flap Failure","Deep SSI","Hematoma/Seroma","Major Dehiscence",
     "Anastomotic Failure","30d Mortality","PRIMARY ENDPOINT","Clavien-Dindo","Outcome Notes","Outcome Recorded"];
@@ -153,7 +154,8 @@ function buildFullCSV(cases, outcomes) {
       a.location||"",a.woundSize||"",a.osteomyelitis||"",a.priorFlap||"",a.soiling||"",a.irradiated?"Y":"N",
       a.diabetes||"",a.smoking||"",a.cardio||"",a.steroids?"Y":"N",
       a.selfReposition||"",a.pressureSurface?"Y":"N",a.socialSupport||"",
-      d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,c.savedAt,
+      d.bio??0,d.wound??0,d.comorbidities??0,d.functional??0,c.score,c.tierLabel,
+      c.projectedScore??"",c.projectedImprovement??"",c.projectedTierLabel??"",c.savedAt,
       o?(oc.cfl?"Y":"N"):"",o?(oc.pfl?"Y":"N"):"",o?(oc.ssi?"Y":"N"):"",o?(oc.hem?"Y":"N"):"",o?(oc.deh?"Y":"N"):"",
       o?(oc.ana?"Y":"N"):"",o?(oc.mort?"Y":"N"):"",o?(o.anyEvent?"YES — EVENT":"NO event"):"",
       o?o.clavienDindo:"",o?o.notes:"",o?o.recordedAt:""];
@@ -164,9 +166,9 @@ function buildFullCSV(cases, outcomes) {
 /* ═══════════════════════════════════════════════
    ADMIN EXPORT
 
-   Wraps Pedro's buildFullCSV rather than reimplementing it, so the
-   first 40 columns stay byte-compatible with the sheet the study
-   already uses. Provenance columns are appended after them.
+   Wraps Pedro's buildFullCSV rather than reimplementing it, so his
+   columns stay byte-compatible with the sheet the study already uses.
+   Provenance columns are appended after them.
 
    Notes are the one free-text field, so newlines are flattened
    before the wrapped call — a literal newline inside a quoted cell
@@ -354,11 +356,11 @@ const THIRTY_DAYS = 30*24*60*60*1000;
 
 /* Bump whenever upstream changes point values or scoring rules. Stored on
    every assessment, because a score only means something alongside the
-   engine that produced it. Between the June build and v1.1, three rules
-   changed: the inflammation toggle went 1→2 pts, red-flag options began
-   contributing their points instead of only raising a flag, and domains
-   became capped at maxPts. */
-export const ENGINE_VERSION = "1.1";
+   engine that produced it. v1.2 (Pedro, 2026-09): osteomyelitis "none"
+   includes treated; smoking gained a 2-week–6-month middle tier; cardio
+   scores symptomatic vs stable rather than condition count; plus the
+   optimization-projection fields. */
+export const ENGINE_VERSION = "1.2";
 
 export function findIssues(cases, outcomes) {
   const issues = [];
@@ -508,7 +510,7 @@ const DOMAINS = [
       options:[{v:"a",label:"< 50",pts:0},{v:"b",label:"50 – 100",pts:1},{v:"c",label:"> 100",pts:2}]},
     { id:"osteomyelitis", type:"radio", label:"Osteomyelitis",
       options:[
-        {v:"a",label:"None",pts:0},
+        {v:"a",label:"None or treated (culture-negative, completed antibiotic course)",pts:0},
         {v:"b",label:"Chronic (> 4 weeks) — sequestrum or sinus tract",pts:1},
         {v:"c",label:"Acute (≤ 4 weeks) — purulent, no sequestrum",pts:3},
       ]},
@@ -528,13 +530,16 @@ const DOMAINS = [
       ]},
     { id:"smoking", type:"radio", label:"Smoking Status",
       options:[
-        {v:"a",label:"Never smoker or former (> 6 months abstinence)",pts:0},
-        {v:"b",label:"Current or quit < 6 months ago",pts:2},
+        {v:"a",label:"Never smoker, or former smoker quit > 6 months ago",pts:0},
+        {v:"c",label:"Former smoker — quit ≥ 2 weeks but ≤ 6 months ago",pts:1},
+        {v:"b",label:"Current smoker, or quit < 2 weeks ago",pts:2},
       ]},
     { id:"cardio", type:"radio", label:"Major Cardiopulmonary / Renal Disease",
+      hint:"Symptomatic status drives the score, not the number of conditions",
       options:[
-        {v:"a",label:"None",pts:0},{v:"b",label:"One stable condition",pts:1},
-        {v:"c",label:"≥ 2 conditions or symptomatic",pts:2},
+        {v:"a",label:"None",pts:0},
+        {v:"b",label:"Stable / asymptomatic (any number of conditions)",pts:1},
+        {v:"c",label:"Symptomatic (any number of conditions)",pts:2},
       ]},
     { id:"steroids", type:"toggle", pts:2, label:"Chronic Steroid Use",
       hint:"≥ 30 days of > 20 mg/day prednisone equivalent" },
@@ -635,6 +640,61 @@ function computeScore(answers) {
 
 function getTier(score){ return TIERS.find(t=>score>=t.min&&score<=t.max)??TIERS[0]; }
 const isIschial=(loc)=>loc==="ischial";
+
+/* ═══════════════════════════════════════════════
+   OPTIMIZATION PROJECTION
+   Modifiable variables can realistically improve within
+   a pre-op optimization window. The projection assumes
+   each modifiable variable improves by ONE tier (not to
+   zero) — a deliberately conservative best-case estimate.
+═══════════════════════════════════════════════ */
+const DOMAIN_COLORS = {bio:"#4472a6", wound:"#c0397f", comorbidities:"#2e8b84", functional:"#6b4c9a"};
+
+const MODIFIABLE = new Set([
+  "albumin","prealbumin","bmi","pct","inflammation",   // Domain 1
+  "osteomyelitis","soiling",                            // Domain 2
+  "diabetes","smoking",                                 // Domain 3
+  "pressureSurface","socialSupport",                    // Domain 4
+]);
+// FIXED (for reference): location, woundSize, priorFlap, irradiated,
+//                        cardio, steroids, selfReposition
+
+// Move a radio field one point-tier better (toward fewer points).
+function oneLevelBetter(field, opt){
+  const tiers=[...new Set(field.options.map(o=>o.pts))].sort((a,b)=>a-b);
+  const idx=tiers.indexOf(opt.pts);
+  if(idx<=0) return opt;                       // already best tier
+  const target=tiers[idx-1];
+  const cands=field.options.filter(o=>o.pts===target);
+  return cands.find(o=>!o.isCI)||cands[0];     // prefer a non-flag option
+}
+
+function projectScore(answers){
+  let total=0; const domainScores={}; const projFlags=[]; const supportImproves={};
+  for(const domain of DOMAINS){
+    let ds=0;
+    for(const f of domain.fields){
+      const val=answers[f.id];
+      const mod=MODIFIABLE.has(f.id);
+      if(f.type==="toggle"){
+        const on=val===true;
+        const projOn=mod?false:on;             // improving a toggle = turn it off
+        ds+=projOn?f.pts:0;
+      } else {
+        const opt=f.options?.find(o=>o.v===val);
+        if(!opt) continue;
+        const proj=mod?oneLevelBetter(f,opt):opt;
+        if(proj.isCI) projFlags.push({flagId:proj.flagId});
+        ds+=proj.pts;
+        // does the social-support variable actually improve?
+        if(f.id==="socialSupport" && proj.pts<opt.pts) supportImproves.social=true;
+      }
+    }
+    ds=Math.min(ds,domain.maxPts);
+    domainScores[domain.id]=ds; total+=ds;
+  }
+  return {total,domainScores,projFlags,supportImproves};
+}
 
 function buildRecs(answers,tierId){
   const recs=[]; const mod=tierId==="moderate"; const hi=tierId==="high";
@@ -1037,6 +1097,104 @@ function TierChip({tierId}){
   return <span className={`tier-chip ${tierId==="flagged"?"not_ideal":tierId}`}>{labels[tierId]||tierId}</span>;
 }
 
+/* Master projection: current vs projected on the full 0–30 scale.
+   Two stacked bars, each colored by its own tier, with faint tier
+   threshold ticks at 5 / 12 / 19. */
+function MasterProjectionBar({ total, tier, projTotal, projTier, improvement }){
+  const MAX=30;
+  const pct=(v)=>`${Math.max(0,Math.min(100,(v/MAX)*100))}%`;
+  const ticks=[5,12,19];
+  return(
+    <div style={{border:"1px solid var(--g2)",borderRadius:10,padding:"16px",marginBottom:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:12}}>
+        <div style={{fontSize:10,fontWeight:800,letterSpacing:".14em",textTransform:"uppercase",color:"var(--k4)"}}>Optimization Potential</div>
+        {improvement>0&&<div style={{fontFamily:"var(--mono)",fontSize:12,fontWeight:700,color:projTier.accent}}>−{improvement} possible</div>}
+      </div>
+
+      {/* Current */}
+      <div style={{marginBottom:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+          <span style={{fontSize:10,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase",color:"var(--k4)"}}>Current</span>
+          <span style={{fontFamily:"var(--mono)",fontSize:12,fontWeight:700,color:tier.accent}}>{total}/30 · {tier.label}</span>
+        </div>
+        <div style={{position:"relative",height:20,background:"#f1f1f1",borderRadius:5,overflow:"hidden"}}>
+          <div style={{position:"absolute",left:0,top:0,bottom:0,width:pct(total),background:tier.bar,borderRadius:5,transition:"width .4s"}}/>
+          {ticks.map(t=><div key={t} style={{position:"absolute",left:pct(t),top:0,bottom:0,width:1,background:"#fff",opacity:.6}}/>)}
+        </div>
+      </div>
+
+      {/* Projected */}
+      <div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+          <span style={{fontSize:10,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase",color:"var(--k4)"}}>After optimization</span>
+          <span style={{fontFamily:"var(--mono)",fontSize:12,fontWeight:700,color:projTier.accent}}>{projTotal}/30 · {projTier.label}</span>
+        </div>
+        <div style={{position:"relative",height:20,background:"#f1f1f1",borderRadius:5,overflow:"hidden"}}>
+          {improvement>0&&(
+            <div style={{position:"absolute",left:pct(projTotal),top:0,bottom:0,width:`calc(${pct(total)} - ${pct(projTotal)})`,
+              background:`repeating-linear-gradient(45deg, ${tier.bar}44, ${tier.bar}44 5px, ${tier.bar}18 5px, ${tier.bar}18 10px)`}}/>
+          )}
+          <div style={{position:"absolute",left:0,top:0,bottom:0,width:pct(projTotal),background:projTier.bar,borderRadius:5,transition:"width .4s"}}/>
+          {ticks.map(t=><div key={t} style={{position:"absolute",left:pct(t),top:0,bottom:0,width:1,background:"#fff",opacity:.6}}/>)}
+        </div>
+      </div>
+
+      <div style={{fontSize:10.5,color:"var(--k4)",marginTop:12,lineHeight:1.5,fontStyle:"italic"}}>
+        {improvement>0
+          ? "Conservative estimate — each modifiable factor improved by one tier. Re-score after optimization to capture the actual value."
+          : "This score reflects primarily fixed factors with limited modifiable potential."}
+      </div>
+    </div>
+  );
+}
+
+function DomainProjectionList({ domainScores, proj, total }){
+  const projImprovement = total - proj.total;
+  const projTier = proj.projFlags.length>0 ? FLAG_TIER : getTier(proj.total);
+  return(
+    <>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+        <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)"}}>Score Breakdown</div>
+      </div>
+      <div style={{fontSize:11.5,color:"var(--k4)",marginBottom:16,lineHeight:1.5}}>
+        Per domain: solid bar = current, slim bar = projected after optimization.
+      </div>
+      {DOMAINS.map(d=>{
+        const ds=domainScores[d.id]??0;
+        const pd=proj.domainScores[d.id]??ds;
+        const delta=ds-pd;
+        const col=DOMAIN_COLORS[d.id]||"#666";
+        let cap;
+        if(delta<=0) cap="No modifiable factors";
+        else if(d.id==="functional"&&proj.supportImproves.social) cap="Projected after support system implementation";
+        else cap="Projected after optimization";
+        return(
+          <div key={d.id} style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:5}}>
+              <span style={{fontSize:12.5,fontWeight:600,color:"var(--k)"}}>{d.label}</span>
+              <span style={{fontFamily:"var(--mono)",fontSize:12,color:"var(--k2)"}}>{ds} <span style={{color:"var(--k4)"}}>/ {d.maxPts}</span></span>
+            </div>
+            <div style={{position:"relative",height:15,background:"#f1f1f1",borderRadius:4,overflow:"hidden"}}>
+              <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${Math.min((ds/d.maxPts)*100,100)}%`,background:col,borderRadius:4,transition:"width .4s"}}/>
+            </div>
+            <div style={{position:"relative",height:6,background:"#f4f4f4",borderRadius:3,overflow:"hidden",marginTop:4}}>
+              <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${Math.min((pd/d.maxPts)*100,100)}%`,background:col,opacity:.5,borderRadius:3,transition:"width .4s"}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginTop:3}}>
+              <span style={{fontSize:9.5,letterSpacing:".03em",color:delta>0?"var(--k4)":"#ccc"}}>{cap}</span>
+              <span style={{fontFamily:"var(--mono)",fontSize:11,fontWeight:700,color:delta>0?col:"#ccc"}}>{delta>0?`−${delta}`:"—"}</span>
+            </div>
+          </div>
+        );
+      })}
+      <div className="b-total" style={{marginTop:12}}>
+        <span className="b-total-lbl">Total F2F Score</span>
+        <span className="b-total-pts">{total} pts{projImprovement>0&&<span style={{fontSize:12,fontWeight:600,color:projTier.accent,marginLeft:8}}>→ {proj.total} projected</span>}</span>
+      </div>
+    </>
+  );
+}
+
 /* ═══════════════════════════════════════════════
    MAIN APP
 ═══════════════════════════════════════════════ */
@@ -1259,6 +1417,9 @@ They will immediately lose all access — they cannot read or enter anything. Th
   const {total,ciFlags,domainScores}=useMemo(()=>computeScore(answers),[answers]);
   const hasScoreFlags = ciFlags.length>0;
   const tier = hasScoreFlags ? FLAG_TIER : getTier(total);
+  const proj = useMemo(()=>projectScore(answers),[answers]);
+  const projTier = proj.projFlags.length>0 ? FLAG_TIER : getTier(proj.total);
+  const projImprovement = total - proj.total;
   const numericTier = getTier(total);
   const recs=useMemo(()=>buildRecs(answers,numericTier.id),[answers,numericTier.id]);
 
@@ -1330,6 +1491,8 @@ They will immediately lose all access — they cannot read or enter anything. Th
             savedAt:new Date().toISOString(),engineVersion:ENGINE_VERSION, answers:{...answers}, score:total,
             tierId:tier.id, tierLabel:tier.label, domainScores:{...domainScores},
             flagged:hasScoreFlags, flagIds:ciFlags.map(c=>c.flagId),
+            projectedScore:proj.total, projectedImprovement:projImprovement,
+            projectedTierLabel:projTier.label, projectedDomainScores:{...proj.domainScores},
           };
           persistCase(caseData);
           setCases(fetchAllCases());
@@ -1801,26 +1964,10 @@ They will immediately lose all access — they cannot read or enter anything. Th
             </div>
           )}
 
+          <MasterProjectionBar total={total} tier={tier} projTotal={proj.total} projTier={projTier} improvement={projImprovement}/>
+
           <div style={{marginBottom:24}}>
-            <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
-            {DOMAINS.map(d=>{
-              const ds=domainScores[d.id]??0;
-              return(
-                <div className="b-row" key={d.id}>
-                  <span className="b-name">{d.label}</span>
-                  <div className="b-right">
-                    <div className="b-bar-wrap"><motion.div className="b-bar-fill"
-                      initial={reduce?false:{width:0}} animate={{width:`${Math.min((ds/d.maxPts)*100,100)}%`}}
-                      transition={{duration:0.6,delay:0.2,ease:"easeOut"}}/></div>
-                    <span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{d.maxPts}</span></span>
-                  </div>
-                </div>
-              );
-            })}
-            <div className="b-total" style={{marginTop:12}}>
-              <span className="b-total-lbl">Total F2F Score</span>
-              <span className="b-total-pts">{total} pts</span>
-            </div>
+            <DomainProjectionList domainScores={domainScores} proj={proj} total={total}/>
           </div>
 
           <div style={{marginBottom:24}}>
@@ -1999,6 +2146,9 @@ They will immediately lose all access — they cannot read or enter anything. Th
     const t=(selCase.tierId==="flagged"?FLAG_TIER:TIERS.find(t=>t.id===selCase.tierId))||TIERS[0];
     const d=selCase.domainScores||{};
     const detailRecs=buildRecs(selCase.answers||{},selCase.tierId);
+    const detailProj=projectScore(selCase.answers||{});
+    const detailProjTier=detailProj.projFlags.length>0 ? FLAG_TIER : getTier(detailProj.total);
+    const detailImprovement=(typeof selCase.score==="number"?selCase.score:0) - detailProj.total;
     return(
       <div>
         <button className="back-link" onClick={()=>setScreen("records")}>← Records</button>
@@ -2017,13 +2167,9 @@ They will immediately lose all access — they cannot read or enter anything. Th
             {t.timing&&<div style={{marginTop:8,paddingTop:8,borderTop:"1px solid #eee",fontFamily:"var(--mono)",fontSize:11,color:t.accent,fontWeight:600}}>⏱ {t.timing}</div>}
           </div>
         </div>
+        <MasterProjectionBar total={selCase.score??0} tier={t} projTotal={detailProj.total} projTier={detailProjTier} improvement={detailImprovement}/>
         <div style={{marginBottom:24}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:12}}>Score Breakdown</div>
-          {DOMAINS.map(dom=>{
-            const ds=d[dom.id]??0;
-            return(<div className="b-row" key={dom.id}><span className="b-name">{dom.label}</span><div className="b-right"><div className="b-bar-wrap"><motion.div className="b-bar-fill" initial={reduce?false:{width:0}} animate={{width:`${Math.min((ds/dom.maxPts)*100,100)}%`}} transition={{duration:0.6,delay:0.15,ease:"easeOut"}}/></div><span className="b-pts">{ds}<span style={{color:"var(--k4)",fontWeight:400}}>/{dom.maxPts}</span></span></div></div>);
-          })}
-          <div className="b-total" style={{marginTop:12}}><span className="b-total-lbl">Total F2F Score</span><span className="b-total-pts">{selCase.score} pts</span></div>
+          <DomainProjectionList domainScores={d} proj={detailProj} total={selCase.score??0}/>
         </div>
         <div style={{marginBottom:24}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:"var(--k4)",marginBottom:16}}>Patient-Specific Action Plan</div>

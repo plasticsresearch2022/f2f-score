@@ -120,9 +120,18 @@ alter table public.assessments add column if not exists source               tex
 -- the engine that produced it — and only reconcilable against that engine.
 -- Rows scored before v1.1 used different rules and must not be silently
 -- mixed with current ones in analysis.
-alter table public.assessments add column if not exists engine_version       text not null default '1.1';
+alter table public.assessments add column if not exists engine_version       text not null default '1.2';
 alter table public.assessments add column if not exists voided_at            timestamptz;
 alter table public.assessments add column if not exists voided_by            uuid references auth.users on delete set null;
+-- Optimization projection: conservative best-case if each modifiable
+-- factor improves by one tier. Nullable so rows scored before v1.2 stay valid.
+alter table public.assessments add column if not exists projected_score          int;
+alter table public.assessments add column if not exists projected_improvement    int;
+alter table public.assessments add column if not exists projected_tier_label     text;
+alter table public.assessments add column if not exists projected_domain_scores  jsonb;
+-- Existing databases still have engine_version defaulting to 1.1; new rows
+-- from the app send 1.2 explicitly. Align the column default on re-run.
+alter table public.assessments alter column engine_version set default '1.2';
 
 create index if not exists assessments_service_idx on public.assessments (service_id, created_at desc);
 create index if not exists assessments_study_idx   on public.assessments (study_id);

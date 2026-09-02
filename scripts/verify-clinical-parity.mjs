@@ -25,6 +25,7 @@ const CLINICAL_SECTIONS = [
   "HOSPITALS", "OUTCOME_FIELDS", "CD_OPTIONS", "cdGradeFromOption",
   "buildCopyText", "buildFullCSV", "RISK_FLAGS", "DOMAINS", "TIERS",
   "FLAG_TIER", "FLAG_ACTIONS", "computeScore", "getTier", "buildRecs",
+  "DOMAIN_COLORS", "MODIFIABLE", "oneLevelBetter", "projectScore",
 ];
 
 function readUpstreamSha() {

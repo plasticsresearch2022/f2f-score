@@ -30,7 +30,7 @@ Author of the clinical model: Pedro Fuenmayor, MD (Larkin Community Hospital, Mi
 
 - **Our repo (canonical):** `yashaefimenko-ai/f2f-score`. Work happens here.
 - **Upstream:** `plasticsresearch2022/f2f-score` (Pedro's, **private**, read-only to us). Requires the **`yashaefimenko-ai`** GitHub account, NOT `heliosxloupes`. Get a token without switching accounts: `gh auth token -u yashaefimenko-ai`.
-- Local: `c:\Users\IVIso\OneDrive\Desktop\Cursor\HeliosX\f2f-score`
+- Local: `c:\Users\IVIso\OneDrive\Desktop\Cursor\f2f-score`
 - Live: https://f2f-score-yeai.vercel.app
 
 **Read `UPSTREAM.md` before touching `src/App.jsx`.** The clinical engine is
@@ -58,7 +58,7 @@ his repo.
 - `FLAG_TIER` / `FLAG_ACTIONS` — an in-domain red flag overrides the numeric tier
 - `RISK_FLAGS` — pre-screen surgical red flags
 - `OUTCOME_FIELDS` / `CD_OPTIONS` — 30-day endpoints, derived Clavien-Dindo
-- `computeScore()`, `getTier()`, `buildRecs()`, `buildFullCSV()`, `buildCopyText()`
+- `computeScore()`, `getTier()`, `buildRecs()`, `projectScore()`, `buildFullCSV()`, `buildCopyText()`
 
 A change to point values, thresholds, or recommendation logic is a **clinical
 decision, not an engineering one** — it happens upstream first, then we re-sync.

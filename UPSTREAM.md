@@ -1,6 +1,6 @@
 # Upstream sync
 
-UPSTREAM_SHA: e541564
+UPSTREAM_SHA: 9e12c31
 
 This repo is a fork of **`plasticsresearch2022/f2f-score`** (Pedro Fuenmayor, MD).
 The line above records the exact upstream commit our `src/App.jsx` clinical
@@ -12,7 +12,8 @@ content is derived from. Keep it accurate — the parity check reads it.
 |---|---|
 | The clinical engine — `DOMAINS`, `TIERS`, `FLAG_TIER`, `FLAG_ACTIONS`, `RISK_FLAGS`, `computeScore`, `getTier`, `buildRecs` | Supabase backend, service auth, admin monitoring |
 | Outcome definitions — `OUTCOME_FIELDS`, `CD_OPTIONS`, `cdGradeFromOption` | Framer Motion, responsive layout, accessibility |
-| Export shape — `buildCopyText`, `buildFullCSV`, `HOSPITALS` | Everything in `src/lib/` |
+| Optimization projection — `MODIFIABLE`, `oneLevelBetter`, `projectScore` | Everything in `src/lib/` |
+| Export shape — `buildCopyText`, `buildFullCSV`, `HOSPITALS` | |
 
 **We never edit the left column.** Those sections are copied verbatim and
 guarded by `scripts/verify-clinical-parity.mjs`. If one of them needs to
